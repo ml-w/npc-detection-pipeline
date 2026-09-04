@@ -1,0 +1,9 @@
+*.log
+*.nii.gz
+*.dcm
+*.xlsx
+*.pyc
+*.npz
+*temp*
+*old*
+*.bak

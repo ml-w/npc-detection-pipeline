@@ -1,0 +1,22 @@
+# CropOrPad target matches the intended network input [320, 320, 25].
+# Note: sampler_kwargs in CFG (patch_size=[320,320,25]) is silently ignored by PMIImageFeaturePairLoader,
+# so this transform is responsible for the final crop size.
+
+ToCanonical:
+  {}
+Resample:
+  - 'input'
+CropOrPad:
+  - [350, 350, 30]
+  - padding_mode: 0
+  - mask_name: "probmap"
+RandomMotion:
+  translation: 5 # mm ~ 10 px
+RandomAffine:
+  scales: [0.9, 1.1]
+  degrees: [10, 10, 15]
+RandomFlip:
+  - 'lr'
+RandomNoise:
+  std: [1, 15]
+

@@ -1,0 +1,8 @@
+models_weights/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.git/
+.idea/
+*.egg-info/
+.env

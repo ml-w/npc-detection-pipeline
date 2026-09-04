@@ -1,0 +1,22 @@
+[project]
+name = "results-viewer"
+version = "0.1.0"
+description = "Streamlit UI for visualising rAIdiologist NPC screening results and self-attention maps"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit",
+    "simpleitk",
+    "opencv-python>=4.6.0",
+    "pandas",
+    "numpy",
+    "plotly",
+    "tqdm",
+    "pydicom>=3.0.1",
+    "rich",
+    "pydantic>=2.0",
+    "mri-normalization-tools"
+]
+
+[tool.uv.scripts]
+viewer-trans   = "streamlit run results_viewer/results_viewer_rAI-trans.py"
+viewer-scdense = "streamlit run results_viewer/results_viewer_scdense.py"

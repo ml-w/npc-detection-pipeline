@@ -1,0 +1,30 @@
+.idea
+*.pt
+*npz
+
+# python
+__pycache__
+
+# secrets / local config
+.env*
+
+# Others
+.DS_Store
+.png
+*.egg
+*.egg-info/
+*.json
+*.log
+*.py[cod]
+*.pyd
+*.pyo
+*.sqlite3
+*nii.gz
+build/
+dist/
+env/
+venv/
+
+# Agents
+.claude
+CLAUDE.md

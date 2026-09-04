@@ -1,0 +1,45 @@
+# This flag file specify what flags are passed to the guild manager
+
+solver_cfg:
+  batch_size        : 8             # @1.3GB GRAM, adjust accordingly
+  num_of_epochs     : 50            # Set to 100 if Exponential LR
+  init_lr           : 1e-5          # Use lr = 1E-3 to 1E-5  for Exponential LR
+  rAI_fixed_mode    : 0             # See README.md
+  accumulate_grad   : 0
+  early_stop        : "loss_reference"
+  early_stop_kwargs : "{'warmup': 5,'patience': 40}"
+  optimizer         : 'SGD'
+  lr_sche           : 'OneCycleLR'  # This LR scheduler is very specific, use ExponentialLR if unsure
+  init_mom          : 0.85          # Set to 0.99 if ExponentialLR
+  lr_sche_args      : 0.02          # Set to 0.95-0.99 for ExponentialLR, see :class:`ExponentialLR`
+  lr_sche_kwargs    : "{'cycle_momentum' : True,'three_phase' : True,'div_factor' : 100}" # Set to empty for ExponetialLR
+  lr_weights        : "{}"          # Adjust cnn to rnn gradient step size ratio, e.g., {'cnn': 0.1, 'rnn': 1}
+  compile_net       : False         # Unstable
+  max_step          : 0             # If there are too many data, you might hit flatau quickly to run the whole batch with the same LR, use this to limit the number of steps ran per epoch.
+
+
+controller_cfg:
+  inference_on_training_set : False
+  validate_on_training_set :  False
+  debug_mode         : False
+  debug_validation   : False
+  fold_code          : 'B00'      # cross-validation fold identifier; selects the .ini id-list and checkpoint name
+  net_name           : 'rai_v5.1' # network architecture tag used by the controller
+  matmul_precision   : 'high'
+  id_list            : None       # [FileList] INI with training/testing/validation sections; None → CFG default derived from fold_code
+  id_list_val        : None       # override validation IDs (plain-text or [FileList] INI); None → uses validation section of id_list
+  cp_load_dir        : None       # checkpoint to resume from; None → CFG default ./Backup/rAIdiologist_{fold_code}.pt
+  rAI_pretrained_CNN : None       # pretrained CNN checkpoint path; None → CFG default ./Backup/rAIdiologist_{fold_code}_pretrain.pt
+  output_dir         : None       # results output directory; None → CFG default ./Results/{fold_code}
+
+
+
+data_loader_cfg:
+  force_augment : False          # If True, force augmentation during testing data loading
+  input_dir     : None           # Nyul-normalised T2WFS images (.nii.gz); None → CFG default (./NPC_Segmentation/…/01.NyulNormalized/)
+  probmap_dir   : None           # HuangThresholding tissue masks (.nii.gz); None → CFG default (./NPC_Segmentation/…/00.HuangMask/)
+  target_dir    : None           # label CSV with is_malignant column; None → CFG default (./NPC_Segmentation/…/Datasheet_v2.csv)
+  id_globber    : None           # regex to extract case IDs from filenames; None → CFG default "^[a-zA-Z]{0,3}[0-9]+"
+  target_column : 'is_malignant' # Column of the CSV file to be used as the ground-truth
+
+

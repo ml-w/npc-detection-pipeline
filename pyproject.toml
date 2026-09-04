@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "npc-detection-pipeline"
+version = "0.2.0"
+description = "End-to-end NPC screening pipeline: Nyul normalisation → tumour localisation → rAIdiologist malignancy discrimination"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "ML Wong", email = "lun.m.wong@cuhk.edu.hk"}
+]
+keywords = [
+    "nasopharyngeal carcinoma",
+    "NPC",
+    "medical imaging",
+    "segmentation",
+    "deep learning",
+    "pytorch",
+    "MRI"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+requires-python = ">=3.9"
+dependencies = [
+    # Core deep-learning stack
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "torchio>=0.19.0",
+    # Medical image I/O and processing
+    "SimpleITK>=2.2.0",
+    "mri-normalization-tools>=0.4.2",
+    # CLI and config
+    "click>=8.0.0",
+    "PyYAML>=6.0",
+    # Scientific Python
+    "numpy>=1.23.0",
+    "scipy>=1.9.0",
+    "scikit-learn>=1.1.0",
+    "pandas>=1.5.0",
+    # Utilities
+    "tqdm>=4.64.0",
+    "matplotlib>=3.5.0",
+    "transformers>=4.15.0,<=4.42.0",
+    "guildai"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+npc-screen = "cli_inference:cli"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "rAIdiologist*",
+    "loctexthist*",
+]
+exclude = ["tests*", "docs*"]
+
+[tool.setuptools.package-data]
+"rAIdiologist" = ["config/**/*.yaml", "config/**/*.yml"]
+"loctexthist"  = ["cli/assets/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310"]

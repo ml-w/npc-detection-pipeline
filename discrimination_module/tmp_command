@@ -1,0 +1,1 @@
+guild runs rm -y 1;NCCL_DEBUG=INFO guild run pretrain controller_cfg.net_name=vgg16 solver_cfg.optimizer=Adam solver_cfg.lr_sche=ExponentialLR solver_cfg.lr_sche_args=0.99 solver_cfg.lr_sche_kwargs='{}' controller_cfg.fold_code=B01

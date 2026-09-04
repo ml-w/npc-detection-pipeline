@@ -1,0 +1,35 @@
+solver_cfg:
+  batch_size: 40      # training batchsize
+  batch_size_val: 40  # batch-size for validation (runs on a single GPU)
+  num_of_epochs: 100
+  init_lr: 1e-5
+  optimizer: 'Adam'
+  decay_on_plateau: False
+  decay_rate_LR: 1
+  early_stop: "loss_reference"
+  early_stop_kwargs: "{'warmup':5,'patience':15}"
+  # class_weights are the per-class loss baselines used by the sigmoid scheduler.
+  # Background (index 0) starts very low so the network is not overwhelmed by empty voxels.
+  class_weights: [0.01, 1.0]
+  # sigmoid_params control how background weight evolves each epoch via SegmentationSolver.decay_optimizer:
+  #   delay   - epoch at which convergence begins
+  #   stretch - slope of the sigmoid (higher = slower transition)
+  #   cap     - ceiling for the background weight (prevents over-correcting)
+  sigmoid_params: {delay: 5, stretch: 1, cap: 0.2}
+  decay_init_epoch: 0 # controls which epoch to start using the sigmoid class weights
+
+controller_cfg:
+  debug_mode: False
+  debug_validation: False
+  sequence: 'T2WFS'          # MRI sequence tag; selects the normaliser states and checkpoint name
+  version: 'v1.0'            # model version tag used in checkpoint filename
+  cp_load_dir: None          # checkpoint to resume from; None → CFG default {models_dir}/checkpoints/NPC_segment_{sequence}_{version}.pt
+  id_list: None              # [FileList] INI with 'training' and 'testing' sections; None → all subjects in data directory
+  id_list_val: None          # validation cohort — plain-text (.txt, one ID per line) or same [FileList] INI with a 'validation' section; None → no validation
+
+data_loader_cfg:
+  force_augment: False
+  input_dir: None            # Nyul-normalised images (.nii.gz); REQUIRED for training — set to DataDir/…/01.NyulNormalized/
+  probmap_dir: None          # tissue/segmentation masks for weighted patch sampling; REQUIRED — set to DataDir/…/00.HuangMask/
+  target_dir: None           # ground-truth tumour segmentation masks (.nii.gz); REQUIRED — set to DataDir/0B.Segmentations/…/
+  id_globber: None           # regex to extract case IDs from filenames; None → CFG default "^[a-zA-Z]{0,5}[0-9]+"

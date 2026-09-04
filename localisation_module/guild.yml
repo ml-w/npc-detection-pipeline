@@ -1,0 +1,111 @@
+- model: localisation
+  operations:
+    train:
+      main: main --skip-posttrain-inference
+      description: Train localisation module (Position and texture aware patch-based model)
+      flags-dest: config:loctexthist/config/flags/flags.yaml
+      flags-import: all
+      output-scalars:
+        training/loss: 'EpochLoss: (\value)'
+        training/validation_loss: 'VAL: (\value)'
+        validation/dsc: 'DSC: (\value)'
+        step: 'Epoch (\step)'
+        training/step_lr: 'LR: (\value)'
+      requires:
+        - default
+
+    train-continue:
+      main: main
+      description: Continue training from the last `train` or `train-continue` operation
+      flags-dest: config:loctexthist/config/flags/flags.yaml
+      flags-import: all
+      output-scalars:
+        training/loss: 'EpochLoss: (\value)'
+        training/validation_loss: 'VAL: (\value)'
+        validation/dsc: 'DSC: (\value)'
+        step: 'Epoch (\step)'
+        training/step_lr: 'LR: (\value)'
+      requires:
+        - default
+        - copy-checkpoint
+        - copy-checkpoint-continue
+
+    validation:
+      main: main --inference
+      flags-import: no
+      output-scalars:
+        avg_dsc: 'Avg_DICE: (\value)'
+        med_dsc: 'Med_DICE: (\value)'
+      requires:
+        - default-inference
+        - operation: train
+          select:
+            - 'flags.yaml'
+          target-type: 'copy'
+        - copy-checkpoint
+        - link-log
+
+  sourcecode:
+    root: ./
+    select:
+      - exclude:
+          dir: 'DataDir'
+      - exclude:
+          dir: 'test'
+      - exclude:
+          dir: '__pycache__'
+      - exclude:
+          dir: 'lab'
+      - '*.py'
+      - '*.pyx'
+      - '*.txt'
+      - '*.so'
+
+
+  resources:
+    default:
+      - file: '../DataDir'
+        target-type: 'link'
+      - file: './'
+        select:
+          - '.*\.ini'
+        target-type: 'copy'
+      - file: './loctexthist/config'
+        select:
+          - '.*\.yaml'
+        target-type: 'copy'
+
+    default-inference:
+      - file: '../DataDir'
+        target-type: 'link'
+      - file: './loctexthist/config'
+        select:
+          - '.*_inf\.yaml'
+        target-type: 'copy'
+
+    config:
+      - file: loctexthist/config/flags/flags.yaml
+        target-type: 'copy'
+
+    copy-checkpoint: # For continue training
+      - operation: train
+        optional: true
+        select:
+        - 'Backup/NPC_segment_[a-zA-Z0-9_]*.pt'
+        target-type: 'copy'
+        target-path: 'Backup'
+
+    copy-checkpoint-continue: # For continue training
+      - operation: train-continue
+        optional: true
+        select:
+        - 'Backup/NPC_segment_[a-zA-Z0-9_]*.pt'
+        target-type: 'copy'
+        target-path: 'Backup'
+
+    link-log:
+      - operation: train
+        select:
+        - 'Backup/Log'
+        target-type: 'link'
+        target-path: 'Backup'

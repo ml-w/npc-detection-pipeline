@@ -1,0 +1,1 @@
+from rAIdiologist.config.network.cnn import *

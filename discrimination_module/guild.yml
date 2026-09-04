@@ -1,0 +1,181 @@
+- model: rAIdiologist
+  operations:
+    pretrain:
+      main: main --pretrain --skip-posttrain-inference
+      description: Pretrain the CNN encoder by classification task.
+      flags:
+        cnn_drop:
+          env-name: cnn_drop
+          default: 0.2
+      flags-dest: config:rAIdiologist/config/flags/flags.yaml
+      flags-import: all
+      output-scalars:
+        training/loss: 'EpochLoss: (\value)'
+        accuracy: 'ACC: (\value)'
+        training/validation_loss: 'VAL: (\value)'
+        step: 'Epoch (\step)'
+        training/step_lr: 'LR: (\value)'
+        AUC: 'OverallAUC: (\value)'
+        sensitivity: 'Sensitivity: (\value)'
+        specificity: 'Specificity: (\value)'
+      requires:
+        - default
+
+    train:
+      main: main --skip-posttrain-inference
+      description: Train the discrimination module.
+      flags:
+        cnn_drop:
+          env-name: cnn_drop
+          default: 0.1
+        rnn_drop:
+          env-name: rnn_drop
+          default: 0.2
+        rai_conf_weight:
+          env-name: RAI_CONF_WEIGHT
+          default: 0.2
+        rai_over_conf_weight:
+          env-name: RAI_OVER_CONF_WEIGHT
+          default: 0.5
+        rai_gamma:
+          env-name: RAI_GAMMA
+          default: 0.8
+      flags-dest: config:rAIdiologist/config/flags/flags.yaml
+      flags-import: all
+      output-scalars:
+        training/loss: 'EpochLoss: (\value)'
+        accuracy: 'ACC: (\value)'
+        training/validation_loss: 'VAL: (\value)'
+        step: 'Epoch (\step)'
+        training/step_lr: 'LR: (\value)'
+      requires:
+        - default
+        - copy-checkpoint-pretrain
+        - copy-checkpoint
+
+    train-ddp:
+      main: main --ddp
+      description: '[Buggy] Run training in DDP mode.'
+      flags-dest: config:rAIdiologist/config/flags/flags.yaml
+      flags-import: all
+      output-scalars:
+        training/loss: 'EpochLoss: (\value)'
+        accuracy: 'ACC: (\value)'
+        training/validation_loss: 'VAL: (\value)'
+        step: 'Epoch (\step)'
+        training/step_lr: 'LR: (\value)'
+      requires:
+        - default
+        - operation: pretrain
+          optional: true
+          select:
+            - '.*_pretrain.pt'
+          target-type: 'copy'
+          target-path: 'Backup'
+
+    validation:
+      main: main --inference
+      description: Validate the discrimination module. Require `train` ops.
+      flags-import: no
+      output-scalars:
+        sensitivity: 'Sensitivity: (\value)'
+        specificity: 'Specificity: (\value)'
+        PPV: 'PPV: (\value)'
+        NPV: 'NPV: (\value)'
+        ACC: 'OverallACC: (\value)'
+        AUC: 'OverallAUC: (\value)'
+      requires:
+        - default-inference
+        - operation: train
+          select:
+            - 'flags.yaml'
+          target-type: 'copy'
+        - copy-checkpoint
+        - link-log
+
+    pretrain-validation:
+      main: main --inference --pretrain
+      flags-import: no
+      output-scalars:
+        sensitivity: 'Sensitivity: (\value)'
+        specificity: 'Specificity: (\value)'
+        PPV: 'PPV: (\value)'
+        NPV: 'NPV: (\value)'
+        ACC: 'OverallACC: (\value)'
+        AUC: 'OverallAUC: (\value)'
+      requires:
+        - operation: pretrain
+          select:
+            - 'flags.yaml'
+          target-type: 'copy'
+        - default
+        - operation: pretrain
+          select:
+            - 'rAIdiologist'
+          target-type: 'link'
+        - copy-checkpoint-pretrain
+
+  sourcecode:
+    root: ./
+    select:
+      - exclude:
+          dir: 'DataDir'
+      - exclude:
+          dir: 'test'
+      - exclude:
+          dir: '__pycache__'
+      - exclude:
+          dir: 'lab'
+      - exclude:
+          dir: 'img'
+      - exclude:
+          dir: 'wandb'
+      - '*.py'
+      - '*.pyx'
+      - '*.txt'
+      - '*.so'
+
+
+  resources:
+    default:
+      - file: '../DataDir'
+        target-type: 'link'
+      - file: './rAIdiologist/config'
+        select:
+          - '.*\.yaml'
+        target-type: 'copy'
+
+    default-inference:
+      - file: '../DataDir'
+        target-type: 'link'
+      - file: './rAIdiologist/config'
+        select:
+          - '.*_inf\.yaml'
+        target-type: 'copy'
+
+    config:
+      - file: rAIdiologist/config/flags/flags.yaml
+        target-type: 'copy'
+
+    copy-checkpoint:
+      - operation: train
+        optional: true
+        select:
+        - 'Backup/rAIdiologist_[a-zA-Z0-9]*.pt'
+        target-type: 'copy'
+        target-path: 'Backup'
+
+    copy-checkpoint-pretrain:
+      - operation: pretrain
+        optional: true
+        select:
+          - 'Backup/.*_pretrain\.pt'
+        target-type: 'copy'
+        target-path: 'Backup'
+
+    link-log:
+      - operation: train
+        select:
+        - 'Backup/Log'
+        target-type: 'link'
+        target-path: 'Backup'

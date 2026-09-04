@@ -1,0 +1,11 @@
+# For inference, all images should have at least 25 slices, otherwise, inference will include empty slices.
+
+ToCanonical:
+  {}
+Resample:
+  - 'input'
+CropOrPad:
+  - [320, 320, 25]
+  - padding_mode: 0
+  - mask_name: "probmap"
+
