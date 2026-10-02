@@ -80,6 +80,24 @@ output/
 
 Add `--debug` to any command to process only the first few cases for a quick sanity check.
 
+#### Reading the self-attention map
+
+In the `SelfAttention` folder, you will find the resampled input ROI with a suffix of `_image` and the transformer self-attention heatmap with a suffix of `_pb_pred` (one `.nii.gz` per case). You can read it directly by loading them in any nii reading software such as [ITK-Snap](https://www.itksnap.org/) by loading the image first and the playback self-attention as 'Additional Image', selecting it as overlay.
+
+![reading_pb](./img/read_pb.gif)
+
+#### Results viewer
+
+An interactive Streamlit app for reviewing predictions is in `discrimination_module/ui/results_viewer/`. It overlays the self-attention heatmap on MRI slices with controls for opacity, threshold, and per-head or averaged attention. TP/TN/FP/FN filtering is available when ground-truth labels are provided.
+
+```bash
+cd discrimination_module/ui
+uv sync          # first time only
+uv run viewer-trans
+```
+
+On first launch, set the **Image Directory**, **Attention Map Directory**, and **Prediction CSV** in the in-app Configurations panel. Settings persist across sessions automatically.
+
 ---
 
 ### Training your own model
