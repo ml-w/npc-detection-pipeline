@@ -12,7 +12,7 @@ discriminate  rAIdiologist malignancy inference + self-attention playback maps
 pipeline      End-to-end: normalize → localize → discriminate
 
 Each step is also available as a standalone Python function (``run_normalize``,
-``run_localize``, ``run_discrimination``) that can be composed in custom scripts.
+``run_localize``, ``run_discrimination``, ``run_pipeline``) that can be composed in custom scripts.
 """
 
 import copy
@@ -268,6 +268,110 @@ def run_discrimination(
         controller.solver_cfg = solver_cfg
         controller.data_loader_cfg = data_loader_cfg
         controller.exec()
+
+
+def run_pipeline(
+    input_dir: Path,
+    output_dir: Path,
+    rai_checkpoint: Path,
+    logger: MNTSLogger,
+    models_dir: Path = _DEFAULT_MODELS_DIR,
+    id_globber: str = r'^[a-zA-Z]{0,5}[0-9]+',
+    id_list: Optional[str] = None,
+    sequence: str = 'T2WFS',
+    skip_norm: bool = False,
+    keep_intermediate: bool = False,
+    skip_post_processing: bool = False,
+    inference_resample_to_origin: bool = False,
+    debug: bool = False,
+    t_start: Optional[float] = None,
+) -> Tuple[Path, Path]:
+    """End-to-end pipeline: normalisation → localisation → discrimination.
+
+    Writes ``output_dir/segmentation/`` and ``output_dir/discrimination/``
+    (plus ``output_dir/normalised/`` when ``keep_intermediate`` is set).
+
+    Returns (seg_out_dir, rai_out_dir).
+    """
+    if t_start is None:
+        t_start = time.time()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_id_list = None
+    if id_list is not None:
+        p = Path(id_list)
+        resolved_id_list = str(p) if p.exists() else id_list
+
+    norm_graph  = _LOCTEXTHIST_ASSETS / 'normalization_t2w.yaml'
+    norm_states = models_dir / 'Normalization-T2w-fs'
+    seg_ckpt    = models_dir / f'checkpoints/NPC_segment_{sequence}_v1.0.pt'
+
+    logger.info(f"Normalization graph : {norm_graph}")
+    logger.info(f"Normalization states: {norm_states}")
+    logger.info(f"Segmentation ckpt   : {seg_ckpt}")
+    logger.info(f"rAIdiologist ckpt   : {rai_checkpoint}")
+    logger.info(f"rAI transform       : {_RAI_TRANSFORM_INF}")
+
+    with tempfile.TemporaryDirectory() as _tmp:
+        tmp = Path(_tmp)
+
+        # ── Steps 1–2: Normalisation ───────────────────────────────────────
+        if not skip_norm:
+            nyul_dir, huang_dir = run_normalize(
+                input_dir, tmp / 'normalised', norm_graph, norm_states, logger, debug=debug
+            )
+        else:
+            logger.info("Skipping normalisation; symlinking input as NyulNormalizer.")
+            normed_dir = tmp / 'normalised'
+            normed_dir.mkdir()
+            nyul_dir  = normed_dir / 'NyulNormalizer'
+            huang_dir = normed_dir / 'HuangThresholding'
+            nyul_dir.symlink_to(input_dir.resolve(), target_is_directory=True)
+            if not huang_dir.is_dir():
+                _make_fallback_probmap(nyul_dir, huang_dir, logger)
+
+        if keep_intermediate:
+            shutil.copytree(nyul_dir.parent, output_dir / 'normalised', dirs_exist_ok=True)
+
+        # ── Steps 3–6: Localisation ────────────────────────────────────────
+        seg_cfg = NPCSegmentControllerCFG()
+        seg_cfg.run_mode   = 'inference'
+        seg_cfg.models_dir = str(models_dir)
+        seg_cfg.sequence   = sequence
+
+        seg_out_dir = output_dir / 'segmentation'
+        run_localize(
+            input_dir=nyul_dir,
+            probmap_dir=huang_dir,
+            output_dir=seg_out_dir,
+            seg_cfg=seg_cfg,
+            logger=logger,
+            models_dir=models_dir,
+            sequence=sequence,
+            t_start=t_start,
+            debug=debug,
+            id_globber=id_globber,
+            id_list=resolved_id_list,
+            keep_intermediate_segments=keep_intermediate,
+            skip_post_processing=skip_post_processing,
+            inference_resample_to_origin=inference_resample_to_origin,
+        )
+        logger.info(f"Final segmentation → {seg_out_dir}")
+
+        # ── Step 7: Discrimination ─────────────────────────────────────────
+        rai_out_dir = output_dir / 'discrimination'
+        run_discrimination(
+            input_dir=nyul_dir,
+            probmap_dir=seg_out_dir,
+            output_dir=rai_out_dir,
+            checkpoint=rai_checkpoint,
+            id_globber=id_globber,
+            id_list=resolved_id_list,
+            logger=logger,
+        )
+        logger.info(f"Discrimination results → {rai_out_dir}")
+
+    return seg_out_dir, rai_out_dir
 
 
 # ---------------------------------------------------------------------------
@@ -558,77 +662,20 @@ def pipeline(
         MNTSLogger.set_global_verbosity(True)
         logger.info("{:=^80}".format(" NPC Screening Pipeline "))
 
-        resolved_id_list = None
-        if id_list is not None:
-            p = Path(id_list)
-            resolved_id_list = str(p) if p.exists() else id_list
-
-        norm_graph  = _LOCTEXTHIST_ASSETS / 'normalization_t2w.yaml'
-        norm_states = models_dir / 'Normalization-T2w-fs'
-        seg_ckpt    = models_dir / f'checkpoints/NPC_segment_{sequence}_v1.0.pt'
-
-        logger.info(f"Normalization graph : {norm_graph}")
-        logger.info(f"Normalization states: {norm_states}")
-        logger.info(f"Segmentation ckpt   : {seg_ckpt}")
-        logger.info(f"rAIdiologist ckpt   : {rai_checkpoint}")
-        logger.info(f"rAI transform       : {_RAI_TRANSFORM_INF}")
-
-        with tempfile.TemporaryDirectory() as _tmp:
-            tmp = Path(_tmp)
-
-            # ── Steps 1–2: Normalisation ───────────────────────────────────
-            if not skip_norm:
-                nyul_dir, huang_dir = run_normalize(
-                    input_dir, tmp / 'normalised', norm_graph, norm_states, logger, debug=debug
-                )
-            else:
-                logger.info("Skipping normalisation; symlinking input as NyulNormalizer.")
-                normed_dir = tmp / 'normalised'
-                normed_dir.mkdir()
-                nyul_dir  = normed_dir / 'NyulNormalizer'
-                huang_dir = normed_dir / 'HuangThresholding'
-                nyul_dir.symlink_to(input_dir.resolve(), target_is_directory=True)
-                if not huang_dir.is_dir():
-                    _make_fallback_probmap(nyul_dir, huang_dir, logger)
-
-            if keep_intermediate:
-                shutil.copytree(nyul_dir.parent, output_dir / 'normalised', dirs_exist_ok=True)
-
-            # ── Steps 3–6: Localisation ────────────────────────────────────
-            seg_cfg = NPCSegmentControllerCFG()
-            seg_cfg.run_mode   = 'inference'
-            seg_cfg.models_dir = str(models_dir)
-            seg_cfg.sequence   = sequence
-
-            seg_out_dir = output_dir / 'segmentation'
-            run_localize(
-                input_dir=nyul_dir,
-                probmap_dir=huang_dir,
-                output_dir=seg_out_dir,
-                seg_cfg=seg_cfg,
-                logger=logger,
-                models_dir=models_dir,
-                sequence=sequence,
-                t_start=t_start,
-                debug=debug,
-                id_globber=id_globber,
-                id_list=resolved_id_list,
-                keep_intermediate_segments=keep_intermediate,
-            )
-            logger.info(f"Final segmentation → {seg_out_dir}")
-
-            # ── Step 7: Discrimination ─────────────────────────────────────
-            rai_out_dir = output_dir / 'discrimination'
-            run_discrimination(
-                input_dir=nyul_dir,
-                probmap_dir=seg_out_dir,
-                output_dir=rai_out_dir,
-                checkpoint=rai_checkpoint,
-                id_globber=id_globber,
-                id_list=resolved_id_list,
-                logger=logger,
-            )
-            logger.info(f"Discrimination results → {rai_out_dir}")
+        run_pipeline(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            rai_checkpoint=rai_checkpoint,
+            logger=logger,
+            models_dir=models_dir,
+            id_globber=id_globber,
+            id_list=id_list,
+            sequence=sequence,
+            skip_norm=skip_norm,
+            keep_intermediate=keep_intermediate,
+            debug=debug,
+            t_start=t_start,
+        )
 
         elapsed = time.time() - t_start
         logger.info("{:=^80}".format(f" Pipeline Done (Total: {elapsed:.1f}s) "))

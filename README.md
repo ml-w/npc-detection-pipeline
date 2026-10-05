@@ -98,6 +98,29 @@ uv run viewer-trans
 
 On first launch, set the **Image Directory**, **Attention Map Directory**, and **Prediction CSV** in the in-app Configurations panel. Settings persist across sessions automatically.
 
+#### Inference web app (Hugging Face Space)
+
+`app.py` is a Streamlit front-end for inference only. It accepts NIfTI (`.nii` / `.nii.gz`) or DICOM
+(`.zip` archives or the files of one series) uploads, exposes the `pipeline` options of `cli_inference.py`,
+and shows the malignancy scores, segmentation and self-attention maps with a download of all outputs.
+
+On first start it downloads the weights from the private Hugging Face repo
+`mlwong/npc_detection_pipeline_weights` into `./npc_detection_pipeline_weights/` (set `HF_TOKEN`);
+a local `models_weights/` directory is used as a fallback.
+
+```bash
+pip install streamlit huggingface_hub
+HF_TOKEN=hf_xxx streamlit run app.py
+```
+
+To publish it as a Docker Space (files in `hf_space/`):
+
+```bash
+python hf_space/deploy.py <user>/<space-name> --private
+```
+
+Then add `HF_TOKEN` (read access to the weights repo) as a secret in the Space settings.
+
 ---
 
 ### Training your own model

@@ -1,0 +1,23 @@
+# Python dependencies of the Hugging Face Space (see Dockerfile for install order).
+# torch/torchvision (CPU wheels) and pytorch_medical_imaging are installed
+# separately in the Dockerfile.
+numpy<2                 # transformers<=4.42 needs numpy 1.x
+torchio>=0.19.0,<0.20    # PMI imports torchio.typing (removed in 0.20)
+opencv-python<4.11       # newer wheels require numpy>=2
+SimpleITK>=2.2.0
+mri-normalization-tools>=0.4.1
+click>=8.0.0
+PyYAML>=6.0
+scipy>=1.9.0
+scikit-learn>=1.1.0
+imbalanced-learn>=0.10.1
+pandas>=1.5.0
+tqdm>=4.64.0
+matplotlib>=3.5.0
+transformers>=4.30.0,<=4.42.0
+einops
+tensorboardX             # imported by pytorch_medical_imaging solvers
+nibabel
+imageio
+streamlit>=1.40
+huggingface_hub>=0.23

@@ -28,3 +28,6 @@ venv/
 # Agents
 .claude
 CLAUDE.md
+
+# Model weights downloaded by the Streamlit app
+npc_detection_pipeline_weights/
