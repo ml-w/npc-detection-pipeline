@@ -10,17 +10,17 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache2.0-green)](LICENSE)
 
 
-Nasopharyngeal carcinoma (NPC) is endemic in the Southeast Asia, and more than 95% of their incidences were WHO Type III undifferentiated NPC, which have excellent treatmetn outcome and survival prognosis if it is detected early. However, early NPC is  very difficult to detect, often asymtomatic or cause only non-specific symptoms. Recently, Epstein-Barr Virus (EBV) blood test on plasma DNA has shown great promise, with high sensitivity and specificity and pickup more early NPC (early:advance roughly 7:3), one weakness currently is the PPV, where roughly 1 in 5 patients with postive results had NPC $^{[1]}$. With more early tumors resulting from EBV blood test, it is crucial to be able to localise them in these patients. In this regard, MRI showed better sensitivity when compared to endoscopy$^{[2-4]}$
+Nasopharyngeal carcinoma (NPC) is endemic in the Southeast Asia, and more than 95% of their incidences were WHO Type III undifferentiated NPC, which have excellent treatmetn outcome and survival prognosis if it is detected early. However, early NPC is  very difficult to detect, often asymtomatic or cause only non-specific symptoms. Recently, Epstein-Barr Virus (EBV) blood test on plasma DNA has shown great promise, with high sensitivity and specificity and pickup more early NPC (early:advance roughly 7:3), one weakness currently is the PPV, where roughly 1 in 5 patients with postive results had NPC (1). With more early tumors resulting from EBV blood test, it is crucial to be able to localise them in these patients. In this regard, MRI showed better sensitivity when compared to endoscopy (2-4)
 
 ---
 
 ## Pipeline overview
 
-| Step | What it does | Output |
-|------|-------------|--------|
-| **1. Normalize** | Nyul intensity normalisation + Huang tissue-mask generation | `NyulNormalizer/` + `HuangThresholding/` |
-| **2. Localize** | Coarse → grow → fine NPC tumour segmentation (UNetLocTexHistDeeper) | segmentation `.nii.gz` masks |
-| **3. Discriminate** | rAIdiologist CNN+Transformer scores malignancy; generates self-attention playback maps | `results.csv` + `SelfAttention/` |
+| Step              | What it does                                                                                                   | Output |
+|-------------------|----------------------------------------------------------------------------------------------------------------|--------|
+| **1.&nbsp;Normalize**  | Nyul intensity normalisation + Huang tissue-mask generation (Use brain mask for optimal normalization instead) | `NyulNormalizer/` + `HuangThresholding/` |
+| **2.&nbsp;Localize**   | Coarse → grow → fine NPC tumour segmentation (UNetLocTexHistDeeper)                                            | segmentation `.nii.gz` masks |
+| **3.&nbsp;Discriminate** | rAIdiologist CNN+Transformer scores malignancy; generates self-attention playback maps                         | `results.csv` + `SelfAttention/` |
 
 Each step is independently callable, or you can run the full pipeline in one command.
 
