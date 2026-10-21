@@ -494,12 +494,18 @@ class TransformerEncoderLayerWithAttn(nn.TransformerEncoderLayer):
         """
         # Reshape the playback data for prediction and confidence
         # 0-th token is the prediction, 2-nd + tokens are image information tokens
+        # Follow the device of the input tensor (was hard-coded to ``.cuda()``). When only a shape is given,
+        # keep the legacy behavior of using CUDA if available, otherwise stay on CPU.
+        if isinstance(in_tensor, torch.Tensor):
+            device = in_tensor.device
+        else:
+            device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
         sa_for_prediction = rearrange(
-            playback[:, :, 0, 2:].cuda(), 'b c (s w h) -> b c h w s', **grid_size
+            playback[:, :, 0, 2:].to(device), 'b c (s w h) -> b c h w s', **grid_size
         )
         # 1-st token is the confidence token
         sa_for_confidence = rearrange(
-            playback[:, :, 1, 2:].cuda(), 'b c (s w h) -> b c h w s', **grid_size
+            playback[:, :, 1, 2:].to(device), 'b c (s w h) -> b c h w s', **grid_size
         )
 
         if isinstance(in_tensor, torch.Tensor):

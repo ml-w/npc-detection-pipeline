@@ -1,0 +1,20 @@
+# Additional packages for REAL (non-mock) inference. Not needed for --mock.
+-r requirements.txt
+mri-normalization-tools>=0.4.2
+# pytorch_med_imaging is NOT on PyPI: install from source (needs Cython + a C compiler):
+#   git clone https://github.com/alabamagan/pytorch_medical_imaging && cd pytorch_medical_imaging
+#   pip install cython && python setup.py build_ext --inplace && pip install --no-deps .
+transformers>=4.30,<5
+scikit-learn
+scikit-image
+scipy
+tensorboardX
+torchvision
+pyyaml
+click
+pydicom
+seaborn
+openpyxl
+tabulate
+tqdm
+cachetools<6

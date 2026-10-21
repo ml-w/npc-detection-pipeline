@@ -1,0 +1,12 @@
+# UI-only dependencies (kept separate from the repo's requirements.txt; install into a dedicated venv).
+gradio>=5,<6
+streamlit>=1.50
+numpy
+torch>=2.0
+torchio>=0.19,<0.20      # pytorch_med_imaging imports torchio.typing, removed in >=0.21
+SimpleITK
+opencv-python-headless
+einops
+matplotlib               # imported by the results_viewer helpers
+rich<15
+pandas<3
