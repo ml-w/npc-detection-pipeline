@@ -7,7 +7,7 @@ name = "npc-detection-pipeline"
 version = "0.2.0"
 description = "End-to-end NPC screening pipeline: Nyul normalisation → tumour localisation → rAIdiologist malignancy discrimination"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 authors = [
     {name = "ML Wong", email = "lun.m.wong@cuhk.edu.hk"}
 ]
@@ -24,7 +24,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Healthcare Industry",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -83,7 +83,7 @@ exclude = ["tests*", "docs*"]
 "loctexthist"  = ["cli/assets/*.yaml"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["discrimination_module/tests"]
 python_files = ["test_*.py", "*_test.py"]
 
 [tool.black]

@@ -209,7 +209,6 @@ Pre-trained weights are **not bundled** in this repository. See [`models_weights
 npc_detection_pipeline/
 ├── cli_inference.py                          # Main CLI entry point
 ├── pyproject.toml
-├── guild.yml                                 # Root proxy for both modules
 ├── models_weights/
 │   ├── checkpoints/NPC_segment_T2WFS_v1.0.pt
 │   ├── Normalization-T2w-fs/                 # Nyul normaliser states

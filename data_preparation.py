@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 import click
 import mnts
 from mnts.mnts_logger import MNTSLogger
@@ -19,7 +20,7 @@ from pathlib import Path
 @click.option('--mnts-graph', '-g',
               type=click.Path(file_okay=True, readable=True, path_type=Path), required = True,
               help='Path to the MNTS graph file needed for normalization steps that involve training.')
-@click.option('--num-workers', '-n', type=int, help='Number of workers to use.')
+@click.option('--num-workers', '-n', default=1, type=int, help='Number of workers to use.')
 @click.option('--keep-log', is_flag=True,
               help='Flag to keep logs. Default log directory is ./[Date]-Normalization.log')
 @click.option('--log-level', default='INFO', help='Logging level.')
@@ -32,13 +33,11 @@ def normalize_input(input_dir   : Path,
                     keep_log   : bool,
                     log_level  : str,
                     verbose    : bool):
-    # create logger
-    if keep_log:
-        # Get the current date
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        # Create the log file name
-        log_file_name = f"{current_date}-Normalization.log"
-    with MNTSLogger(log_file_name=log_file_name, keep_file=keep_log, log_level=log_leve, verbose=verbose) as logger:
+    # Get the current date
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    # Create the log file name
+    log_file_name = f"{current_date}-Normalization.log"
+    with MNTSLogger(log_dir=log_file_name, keep_file=keep_log, log_level=log_level, verbose=verbose) as logger:
         logger.info("{:=^150}".format(" Initiating Normalization "))
 
         # creates the graph
@@ -56,7 +55,7 @@ def normalize_input(input_dir   : Path,
         output_prefix = [f.name for f in input_fpaths] # name of output files
         input_vector = [output_prefix, [output_dir], input_fpaths]
 
-        if num_workers >= 1:
+        if num_workers <= 1:
             logger.info("Start processing input without parallelization.")
             for row in repeat_zip(*input_vector):
                 G.mpi_execute(*row)
