@@ -2,7 +2,6 @@
 
 Run from the ``ui`` directory so ``.streamlit/config.toml`` (theme) is picked up::
 
-    NPC_UI_MOCK=1 streamlit run app_streamlit.py     # synthetic model, no weights needed
     streamlit run app_streamlit.py                    # real model
 
 Everything the viewer draws is rendered by cached functions keyed on a per-result id plus the display settings, so
@@ -27,7 +26,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "discrimination_module" / "ui" / "results_viewer"))
 
-from inference_api import (CaseOutcome, InputError, ModelUnavailableError, axial_view, env_mock_default,  # noqa: E402
+from inference_api import (CaseOutcome, InputError, ModelUnavailableError, axial_view,  # noqa: E402
                            export_segmentation, list_dicom_series, reduce_attention, run_inference_batch)
 from visualization import apply_jet_colormap, draw_contour                                    # noqa: E402  (viewer)
 
@@ -38,11 +37,8 @@ OUTLINE_WIDTH = {1: 1, 2: 2}          # image scale -> contour thickness in outp
 GRID_COLS = 5
 
 # Short description condensed from README.md (intro + "Pipeline overview").
-INTRO = ("Nasopharyngeal carcinoma (NPC) is endemic in Southeast Asia, and early tumours are hard to detect. "
-         "EBV plasma-DNA screening finds more early disease but has a modest PPV, so localising the tumour on MRI "
-         "in screen-positive patients matters. This pipeline normalises a T2-weighted fat-suppressed MRI, "
-         "localises the tumour, and scores malignancy with rAIdiologist, a CNN + Transformer that also produces a "
-         "self-attention map for interpretation.")
+INTRO = ("This pipeline is dedicated to detect NPC on MRI T2-weigthed fat-suppressed image. Follow the instructions below and "
+         "results will be shown after the computation complete. This UI supports multiple-case processing.")
 STEPS = [("1", "Normalise", "Nyul intensity normalisation and tissue mask"),
          ("2", "Localise", "Coarse, grow, fine tumour segmentation"),
          ("3", "Discriminate", "Malignancy score and self-attention maps")]
@@ -86,6 +82,7 @@ h2, h3, h4 { letter-spacing:-0.01em; color:var(--npc-ink); }
 .npc-chip b { color:var(--npc-ink); font-weight:600; }
 .npc-cbar { height:12px; border-radius:6px; margin-top:.35rem; border:1px solid var(--npc-line); }
 .npc-cbar-l { display:flex; justify-content:space-between; color:var(--npc-muted); font-size:.75rem; margin-top:.2rem; }
+.npc-dl-gap { height:1.1rem; }
 </style>
 """
 
@@ -96,7 +93,8 @@ DARK_CSS = """
 :root { --npc-accent:#968ae0; --npc-accent2:#796cbf; --npc-ink:#e7e8f0; --npc-muted:#9aa0b4; --npc-line:#2f3345;
         --npc-soft:#1a1d29; --npc-pos:#ff9a8d; --npc-pos-bg:#3a201f; --npc-neg:#6fd9ad; --npc-neg-bg:#143027;
         --npc-card-top:#202433; --npc-chip:#1a1d29; --npc-track:#2b2f42; color-scheme:dark; }
-.stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"], [data-testid="stMain"] { background:#0f1117 !important; }
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] { background:#0f1117 !important; }
+[data-testid="stHeader"] { background:transparent !important; }
 .stApp, .stApp p, .stApp li, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5,
 [data-testid="stMarkdownContainer"] *, [data-testid="stWidgetLabel"] *, [data-testid="stCaptionContainer"] *,
 [data-testid="stCheckbox"] label *, [data-testid="stRadio"] label *, [data-testid="stExpander"] summary *,
@@ -238,7 +236,7 @@ def _fmt_prob(p: float) -> str:
 
 def _result_card(res) -> str:
     chips = [("Case", res.case_id), ("Input", res.input_kind), ("Normalised", "yes" if res.normalized else "no"),
-             ("Run", f"{res.mode} / {res.device}"), ("Time", f"{res.elapsed_s:.1f} s")]
+             ("Device", res.device), ("Time", f"{res.elapsed_s:.1f} s")]
     chip_html = "".join(f'<span class="npc-chip">{html.escape(k)} <b>{html.escape(str(v))}</b></span>' for k, v in chips)
     return (
         '<div class="npc-card"><div class="npc-card-head"><div>'
@@ -371,14 +369,12 @@ with st.container(border=True):
     st.markdown('<p class="npc-hint">DICOM is always converted and normalised. A NIfTI straight from the scanner '
                 'needs normalisation: leave it ticked unless the file is already Nyul-normalised.</p>',
                 unsafe_allow_html=True)
-    opt_l, opt_r = st.columns([3, 1], vertical_alignment="center")
+    opt_l, opt_r = st.columns([3, 1], vertical_alignment="bottom")
     with opt_l:
-        normalize = st.checkbox("Run intensity normalisation (NIfTI only)", value=True,
-                                help="Unticked = the NIfTI is treated as already normalised. DICOM is always "
-                                     "converted and normalised.")
         with st.expander("Advanced"):
-            mock = st.checkbox("Mock mode (synthetic model)", value=env_mock_default(),
-                               help="Also enabled by env NPC_UI_MOCK=1. Scores/attention are NOT clinically meaningful.")
+            normalize = st.checkbox("Run intensity normalisation (NIfTI only)", value=True,
+                                    help="Unticked = the NIfTI is treated as already normalised. DICOM is always "
+                                         "converted and normalised.")
     with opt_r:
         run = st.button("Run inference", type="primary", width="stretch", disabled=not uploads)
 
@@ -386,7 +382,7 @@ if run and uploads:
     bar = st.progress(0.0, text="Starting")
     paths = _scan_uploads(uploads)["paths"]
     try:
-        outcomes = run_inference_batch(paths, normalize=normalize, with_attention=True, mock=mock,
+        outcomes = run_inference_batch(paths, normalize=normalize, with_attention=True,
                                        series_uid=series_uid,
                                        progress=lambda frac, msg: bar.progress(min(frac, 1.0), text=msg))
         st.session_state["outcomes"] = outcomes
@@ -418,6 +414,12 @@ if len(outcomes) > 1:
          for i, oc in enumerate(outcomes)],
         hide_index=True, width="stretch",
         column_config={"P(malignant)": st.column_config.NumberColumn(format="%.3f")})
+
+# ============================================================================================================
+# Result: case selector (batch only) -> warnings -> card -> downloads -> raw outputs
+# ============================================================================================================
+st.markdown('<div class="npc-section">Result</div>', unsafe_allow_html=True)
+if len(outcomes) > 1:
     labels = {i: f"{i + 1}. {oc.name}" + ("" if oc.result else " (failed)") for i, oc in enumerate(outcomes)}
     sel = st.selectbox("Case", options=list(labels), format_func=labels.get, key=f"case_{run_id}")
 else:
@@ -429,20 +431,22 @@ if oc.result is None:
     st.stop()
 res = oc.result
 rid = f"{run_id}:{sel}"          # per-case cache key: _window / _slice_img / _seg_nifti use it
-
-# ============================================================================================================
-# Result
-# ============================================================================================================
-st.markdown('<div class="npc-section">Result</div>', unsafe_allow_html=True)
 for w in res.warnings:
     st.warning(w)
 st.markdown(_result_card(res), unsafe_allow_html=True)
-if res.segmentation_image is not None:
-    st.download_button("Download segmentation (NIfTI)", data=_seg_nifti(rid, res),
-                       file_name=f"{res.case_id}_segmentation.nii.gz", mime="application/gzip")
-if len(outcomes) > 1 and any(o.result is not None and o.result.segmentation_image is not None for o in outcomes):
-    st.download_button("Download all segmentations (ZIP)", data=_segs_zip(run_id, outcomes),
-                       file_name=f"segmentations_{run_id[:8]}.zip", mime="application/zip")
+st.markdown('<div class="npc-dl-gap"></div>', unsafe_allow_html=True)
+show_case_dl = res.segmentation_image is not None
+show_zip = len(outcomes) > 1 and any(o.result is not None and o.result.segmentation_image is not None for o in outcomes)
+if show_case_dl or show_zip:
+    dl_case, dl_zip, _ = st.columns([2, 2, 3], gap="small")
+    if show_case_dl:
+        dl_case.download_button("Download this case (NIfTI)", data=_seg_nifti(rid, res),
+                                file_name=f"{res.case_id}_segmentation.nii.gz", mime="application/gzip",
+                                width="stretch")
+    if show_zip:
+        dl_zip.download_button("Download all cases (ZIP)", data=_segs_zip(run_id, outcomes),
+                               file_name=f"segmentations_{run_id[:8]}.zip", mime="application/zip",
+                               width="stretch")
 with st.expander("Raw network outputs"):
     st.write(dict(zip(["fused logit", "rnn confidence", "rnn-only logit"], [round(v, 3) for v in res.raw_outputs])))
 
@@ -469,7 +473,7 @@ with ctrl_col:
         st.markdown("**Tumour outline**")
         show_seg = st.checkbox("Show tumour outline", value=bool(len(seg_slices)), disabled=not len(seg_slices))
         if seg is None:
-            st.caption("No segmentation was produced for this run (mock mode, or no localisation model).")
+            st.caption("No segmentation was produced for this run (no localisation model).")
         elif not len(seg_slices):
             st.caption("The localisation model found no tumour (empty segmentation): nothing to outline.")
         else:

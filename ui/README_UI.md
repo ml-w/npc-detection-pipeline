@@ -16,28 +16,18 @@ treated as already normalised).
 ```bash
 cd ui
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt            # mock mode only needs this
-# real inference additionally: pip install -r requirements-real.txt  (+ build pytorch_med_imaging, see file)
+pip install -r requirements.txt            # base install
+# real inference additionally: pip install -r requirements-real.txt  (adds the real-inference dependencies; + build pytorch_med_imaging, see file)
 ```
 
 ## Run
 
 ```bash
-# Mock mode (synthetic model + synthetic attention; no weights needed)
-python app_gradio.py --mock                      # http://127.0.0.1:7860
-NPC_UI_MOCK=1 streamlit run app_streamlit.py     # http://localhost:8501
-
-# Real mode (needs models_weights/rAIdiologist_B01.pt, distributed under NDA)
-python app_gradio.py
-streamlit run app_streamlit.py
+python app_gradio.py                       # http://127.0.0.1:7860
+streamlit run app_streamlit.py             # http://localhost:8501
 ```
 
-## Mock mode
-
-`--mock` / `NPC_UI_MOCK=1` replaces the 591 M-parameter rAIdiologist with `MockRAIdiologist`, which has the same
-I/O contract (`(B,1,320,320,S)` -> `(B,3,1)`, plus a `(1,20,T,T)`-style attention playback), so the same UI code
-and the same playback -> attention-volume path run unchanged. Scores and attention are **synthetic**; the UI says so.
-Switching to real weights needs no UI change: drop the `.pt` in `models_weights/` (or pass `checkpoint=`).
+Weights: the real model needs `models_weights/rAIdiologist_B01.pt` (distributed under NDA), or pass `checkpoint=`.
 Real mode is verified on the example cases: CLI, `inference_api`, Gradio and Streamlit give the same score.
 
 ## DICOM series selection and segmentation download
@@ -51,8 +41,7 @@ selectbox. The Python API behaves the same way: an ambiguous upload raises `Inpu
 **Segmentation download.** When a segmentation exists, the result card offers *Download segmentation (NIfTI)*
 (`<case_id>_segmentation.nii.gz`). `export_segmentation()` writes the tumour mask on the ORIGINAL input grid: the
 same voxel grid, spacing, origin and direction as the uploaded image, not the resampled network grid. The button
-only appears when `InferenceResult.segmentation_image` is set, so it is never shown in mock mode (no localisation
-runs there).
+only appears when `InferenceResult.segmentation_image` is set, i.e. when a localisation model ran.
 
 ## Batch of NIfTI files
 
@@ -72,11 +61,11 @@ Python API: `run_inference(paths)` scores one case and raises `InputError` on tw
 
 * Score = `sigmoid(out[:, 0])`. The network actually emits 3 channels (fused logit, RNN confidence, RNN-only
   logit), not the 2 the docs mention.
-* Device: CUDA > MPS > CPU (mock stays on CPU). `lstm_rater.py` / `rAIdiologistSolver.py` were minimally patched
+* Device: CUDA > MPS > CPU. `lstm_rater.py` / `rAIdiologistSolver.py` were minimally patched
   (device-aware `sa_from_playback`, `map_location='cpu'`) so attention works off-CUDA.
 * Streamlit reuses `apply_jet_colormap` and `draw_contour` from `discrimination_module/ui/results_viewer`; the
   windowing and blending are done in `app_streamlit.py` (vectorised, cached).
 * Attention colours: per case, min-max scaled, thresholded, then JET (blue = low, red = high). The mapping never
   depends on the score. (An earlier version flipped R/B channels, which showed high attention as blue; fixed.)
 * Tumour outline: `InferenceResult.segmentation` is the localisation mask after the same resample / crop as the
-  network input. Empty mask = the model located no tumour; `None` = no localisation ran (mock mode).
+  network input. Empty mask = the model located no tumour; `None` = no localisation model was available.
