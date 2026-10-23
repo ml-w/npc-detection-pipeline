@@ -1,4 +1,4 @@
-# Additional packages for REAL (non-mock) inference. Not needed for --mock.
+# Additional packages for REAL inference (on top of requirements.txt).
 -r requirements.txt
 mri-normalization-tools>=0.4.2
 # pytorch_med_imaging is NOT on PyPI: install from source (needs Cython + a C compiler):

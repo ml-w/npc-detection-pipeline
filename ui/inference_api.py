@@ -1,6 +1,7 @@
 """Shared inference API for the NPC (rAIdiologist) Gradio / Streamlit front-ends.
 
-One entry point, :func:`run_inference`, used by both ``app_gradio.py`` and ``app_streamlit.py``.
+One entry point for one case, :func:`run_inference` (used by ``app_gradio.py``), and :func:`run_inference_batch`
+for several uploads, each scored as its own case (used by ``app_streamlit.py``).
 
 Pipeline
 --------
@@ -12,14 +13,7 @@ Pipeline
 4. **Output**: malignancy probability and, optionally, the Transformer self-attention volume
    (:class:`InferenceResult`).
 
-Mock mode
----------
-``mock=True`` (or env ``NPC_UI_MOCK=1``) swaps the 591 M-parameter network for :class:`MockRAIdiologist`, which
-returns a deterministic score and a synthetic attention playback with the *same tensor layout* as the real
-network, so the UI can be exercised without the NDA weights.  Everything after the network (playback ->
-attention volume) is the shared code path.  Normalisation is also replaced by a trivial stand-in in mock mode.
-
-Real mode needs ``pytorch_med_imaging``, ``mnts`` (mri-normalization-tools) and the weights described in
+The network needs ``pytorch_med_imaging``, ``mnts`` (mri-normalization-tools) and the weights described in
 ``models_weights/instructions-to-obtain-model-weights.md``.  It has NOT been verified here (no weights available).
 
 Output channels
@@ -32,7 +26,7 @@ quantity ``rAIdiologistInferencer`` writes to ``results.csv``).
 from __future__ import annotations
 
 import logging
-import os
+import re
 import shutil
 import tempfile
 import threading
@@ -40,12 +34,14 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    import SimpleITK as sitk
 
 logger = logging.getLogger("npc_ui")
 
@@ -54,8 +50,6 @@ DEFAULT_MODELS_DIR = REPO_ROOT / "models_weights"
 DEFAULT_CHECKPOINT = DEFAULT_MODELS_DIR / "rAIdiologist_B01.pt"
 
 PATCH_SIZE = (320, 320, 25)        # H, W, S expected by the network (see rAIdiologist_transform_inf.yaml)
-GRID_SIZE = 8                      # CNN grid per slice, 8 x 8 tokens (rAIdiologist_Transformer default)
-NUM_LAYERS = 20                    # Transformer layers == "channels" of the attention volume
 DECISION_THRESHOLD = 0.5
 INTERNAL_CASE_ID = "NPC0001"       # matches the pipeline's id globber ``^[a-zA-Z]{0,5}[0-9]+``
 
@@ -70,7 +64,18 @@ class InputError(ValueError):
 
 
 class ModelUnavailableError(RuntimeError):
-    """Real mode was requested but a checkpoint / dependency is missing (user-facing message)."""
+    """A checkpoint or dependency is missing (user-facing message)."""
+
+
+@dataclass
+class DicomSeries:
+    uid: str                             # SeriesInstanceUID
+    description: str                     # SeriesDescription (0008,103E)
+    modality: str                        # Modality (0008,0060)
+    series_number: str                   # SeriesNumber (0020,0011)
+    n_files: int
+    files: List[Path]                    # in SimpleITK reading order
+    is_t2w_fs: bool                      # T2-weighted fat-saturated, see _is_t2w_fs
 
 
 @dataclass
@@ -78,7 +83,6 @@ class InferenceResult:
     case_id: str
     score: float                         # sigmoid(out[:, 0]) in [0, 1]
     decision: bool                       # score >= DECISION_THRESHOLD
-    mode: str                            # "mock" | "real"
     device: str
     input_kind: str                      # "nifti" | "dicom"
     normalized: bool                     # True if a normalisation step ran in this call
@@ -88,6 +92,7 @@ class InferenceResult:
     volume: Optional[np.ndarray] = None      # (H, W, S) float32, RAS+, first slice dropped (as the attention)
     attention: Optional[np.ndarray] = None   # (layers, H, W, S) int16, 0..1000 (same scaling as results viewer)
     segmentation: Optional[np.ndarray] = None  # (H, W, S) uint8 tumour mask in the same grid as ``volume``; None = not run
+    segmentation_image: Optional[sitk.Image] = None  # same mask on the ORIGINAL input grid; see export_segmentation
 
     @property
     def label(self) -> str:
@@ -95,15 +100,19 @@ class InferenceResult:
 
     def summary(self) -> str:
         return (f"{self.case_id}: P(malignant) = {self.score:.3f} -> {self.label} "
-                f"[{self.mode}, {self.device}, {self.elapsed_s:.1f}s]")
+                f"[{self.device}, {self.elapsed_s:.1f}s]")
+
+
+@dataclass
+class CaseOutcome:
+    name: str                                  # uploaded file name for NIfTI; "DICOM series" for a DICOM upload
+    result: Optional[InferenceResult] = None
+    error: Optional[str] = None                # user-facing message; exactly one of result / error is set
 
 
 # --------------------------------------------------------------------------------------------------
 # Environment helpers
 # --------------------------------------------------------------------------------------------------
-def env_mock_default() -> bool:
-    return os.environ.get("NPC_UI_MOCK", "").strip().lower() in {"1", "true", "yes", "on"}
-
 
 def pick_device(preferred: str = "auto") -> torch.device:
     """CUDA > MPS > CPU unless ``preferred`` names one explicitly."""
@@ -193,9 +202,10 @@ def _validate_nifti(path: Path) -> None:
 
 
 def detect_input(paths: Sequence[Union[str, Path]], scratch: Path) -> Tuple[str, List[Path]]:
-    """Return ``(kind, files)``; ``kind`` is ``"nifti"`` (one file) or ``"dicom"`` (a series' files).
+    """Return ``(kind, files)``: ``"nifti"`` with every NIfTI file (one case each) or ``"dicom"`` with a series' files.
 
-    Raises :class:`InputError` for empty / mixed / unsupported / ambiguous uploads.
+    Raises :class:`InputError` for empty / mixed / unsupported uploads. NIfTI files are NOT validated here (see
+    :func:`_score_case`).
     """
     files = _expand(paths, scratch)
     if not files:
@@ -205,17 +215,15 @@ def detect_input(paths: Sequence[Union[str, Path]], scratch: Path) -> Tuple[str,
     if niftis and dicoms:
         raise InputError("Mixed NIfTI and DICOM upload; provide one or the other.")
     if niftis:
-        if len(niftis) > 1:
-            raise InputError(f"{len(niftis)} NIfTI files given; this UI scores one case at a time.")
-        _validate_nifti(niftis[0])
         return "nifti", niftis
     if dicoms:
         return "dicom", dicoms
-    raise InputError("Unsupported input. Provide one .nii/.nii.gz file or a DICOM series (files, folder or .zip).")
+    raise InputError("Unsupported input. Provide one or more .nii/.nii.gz files or a DICOM series "
+                     "(files, folder or .zip).")
 
 
 # --------------------------------------------------------------------------------------------------
-# DICOM conversion & (mock) normalisation
+# DICOM conversion
 # --------------------------------------------------------------------------------------------------
 def _stage_dicom(files: Sequence[Path], dest: Path) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
@@ -224,17 +232,27 @@ def _stage_dicom(files: Sequence[Path], dest: Path) -> Path:
     return dest
 
 
-def dicom_to_nifti(dicom_dir: Path, out_path: Path) -> Path:
-    """Convert the largest DICOM series in ``dicom_dir`` to NIfTI with SimpleITK."""
+_T2_RE = re.compile(r"(?<![a-z0-9])t2(?!\d)", re.IGNORECASE)
+_FAT_SAT_RE = re.compile(r"(?<![a-z])(fs|fat[\s_-]?sat\w*|fat[\s_-]?supp\w*|spir|spair)(?![a-z])", re.IGNORECASE)
+_NEGATED_FAT_SAT_RE = re.compile(r"(?<![a-z])(no|non|without|w/o)[\s_-]*(fs|fat)", re.IGNORECASE)
+
+
+def _is_t2w_fs(*texts: str) -> bool:
+    """True when the texts (SeriesDescription, ProtocolName) name a T2-weighted fat-saturated sequence.
+
+    T2: a ``T2`` token (``T2_TSE``, ``T2W``, ``ax_t2``); ``T2FLAIR`` also matches T2 but is not fat-sat, so it is not
+    flagged.  Fat-sat: ``FS``, ``fat sat`` / ``fat-saturated``, ``SPIR`` / ``SPAIR``, ``fat suppressed``.  Negated
+    forms (``non-FS``, ``no fat sat``, ``without fat sat``) are rejected.  Case-insensitive.
+    """
+    text = " ".join(t for t in texts if t)
+    return bool(_T2_RE.search(text) and _FAT_SAT_RE.search(text) and not _NEGATED_FAT_SAT_RE.search(text))
+
+
+def _read_dicom_series(files: Sequence[Path]) -> "sitk.Image":
+    """Read one series (files in GDCM order, as returned by :func:`list_dicom_series`) as a 3D SimpleITK image."""
     import SimpleITK as sitk
-    series_ids = sitk.ImageSeriesReader.GetGDCMSeriesIDs(str(dicom_dir))
-    if not series_ids:
-        raise InputError("No readable DICOM series found.")
-    # (read errors below are re-raised as InputError)
-    best = max((sitk.ImageSeriesReader.GetGDCMSeriesFileNames(str(dicom_dir), sid) for sid in series_ids),
-               key=len)
     reader = sitk.ImageSeriesReader()
-    reader.SetFileNames(best)
+    reader.SetFileNames([str(f) for f in files])
     try:
         image = reader.Execute()
     except RuntimeError as exc:
@@ -242,110 +260,80 @@ def dicom_to_nifti(dicom_dir: Path, out_path: Path) -> Path:
                          f"{str(exc).strip().splitlines()[0][:160]}") from exc
     if image.GetDimension() != 3 or image.GetSize()[2] < 2:
         raise InputError("The DICOM series is not a 3D volume.")
-    sitk.WriteImage(image, str(out_path))
-    return out_path
+    return image
 
 
-def _mock_normalize(src: Path, dst: Path) -> Path:
-    """Stand-in for Nyul normalisation in mock mode: percentile clip + rescale to [0, 100]."""
+def _dicom_tags(path: Path) -> Dict[str, str]:
+    """SeriesDescription, ProtocolName, Modality and SeriesNumber of one file (header only)."""
     import SimpleITK as sitk
-    try:
-        img = sitk.ReadImage(str(src), sitk.sitkFloat32)
-    except RuntimeError as exc:
-        raise InputError(f"'{src.name}' cannot be read (file may be corrupt or truncated): "
-                         f"{str(exc).strip().splitlines()[0][:160]}") from exc
-    arr = sitk.GetArrayFromImage(img)
-    lo, hi = np.percentile(arr, [0.5, 99.5])
-    if hi <= lo:
-        raise InputError("Image is constant; cannot normalise.")
-    out = sitk.GetImageFromArray(np.clip((arr - lo) / (hi - lo), 0, 1) * 100.0)
-    out.CopyInformation(img)
-    sitk.WriteImage(out, str(dst))
-    return dst
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(str(path))
+    reader.LoadPrivateTagsOn()
+    reader.ReadImageInformation()
+
+    def get(key: str) -> str:
+        return reader.GetMetaData(key).strip() if reader.HasMetaDataKey(key) else ""
+
+    return {"description": get("0008|103e"), "protocol": get("0018|1030"),
+            "modality": get("0008|0060"), "series_number": get("0020|0011")}
 
 
-# --------------------------------------------------------------------------------------------------
-# Mock network
-# --------------------------------------------------------------------------------------------------
-class MockRAIdiologist(nn.Module):
-    """Fake rAIdiologist with the real network's I/O contract.
+def list_dicom_series(paths: Sequence[Union[str, Path]], scratch: Path) -> List[DicomSeries]:
+    """Group the DICOM files in ``paths`` (files, folder or zip) into series with SimpleITK / GDCM.
 
-    * input  ``(B, 1, 320, 320, S)`` -> output ``(B, 3, 1)`` = [fused logit, rnn confidence, rnn-only logit].
-    * after each forward, ``get_playback()`` holds one tensor ``(1, 20, 2, 2 + (S-1) * 8 * 8)`` where
-      ``[:, :, 0]`` is the classification-token attention and ``[:, :, 1]`` the confidence-token attention
-      (the real playback is ``(1, 20, T, T)``; :meth:`sa_from_playback` only reads rows 0 and 1).
-    * the "attention" is a softmax over the per-token mean intensity, so it highlights bright regions
-      (the synthetic lesion), and the score rises with how focal the brightest region is.
+    Each :class:`DicomSeries` lists its files in the order SimpleITK reads them and carries ``is_t2w_fs``.
+    Raises :class:`InputError` when there are no DICOM files.
     """
-
-    is_mock = True
-
-    def __init__(self):
-        super().__init__()
-        self._grid_size = [GRID_SIZE, GRID_SIZE]
-        self.register_buffer("_mode", torch.IntTensor([3]))
-        self._record = False
-        self.play_back: List[torch.Tensor] = []
-        self.anchor = nn.Parameter(torch.zeros(1), requires_grad=False)   # gives the module a device
-
-    @property
-    def RECORD_ON(self) -> bool:
-        return self._record
-
-    @RECORD_ON.setter
-    def RECORD_ON(self, flag: bool) -> None:
-        self._record = bool(flag)
-
-    def set_mode(self, mode: int) -> None:
-        self._mode.fill_(mode)
-
-    def clean_playback(self) -> None:
-        self.play_back = []
-
-    def get_playback(self) -> List[torch.Tensor]:
-        return self.play_back
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.to(self.anchor.device).float()
-        g = self._grid_size[0]
-        s = x.shape[-1] - 1                                  # first slice is dropped, as in the real network
-        pooled = F.adaptive_avg_pool3d(x[..., 1:], (g, g, s))[0, 0]              # (h, w, s)
-        z = (pooled.max() - pooled.mean()) / (pooled.std() + 1e-6)               # how focal is the brightest area
-        logit = 1.5 * (z - 3.5)
-        conf = torch.sigmoid(z - 3.0) * 0.6 + 0.2
-        if self._record:
-            tokens = pooled.permute(2, 1, 0).reshape(-1)                         # order 's w h', as the real net
-            tokens = (tokens - tokens.mean()) / (tokens.std() + 1e-6)
-            layers = []
-            for l in range(NUM_LAYERS):
-                sharp = 1.0 + 0.25 * l                                           # deeper layers focus more
-                pred = torch.softmax(tokens * sharp, dim=0)
-                cnf = torch.softmax(tokens * sharp * 0.5, dim=0)
-                layers.append(torch.stack([F.pad(pred, (2, 0)), F.pad(cnf, (2, 0))]))
-            self.play_back.append(torch.stack(layers)[None].cpu())               # (1, 20, 2, 2 + s*g*g)
-        return torch.stack([logit, conf, logit * 0.9]).view(1, 3, 1).to(x.device)
+    import SimpleITK as sitk
+    files = [f for f in _expand(paths, scratch / "expand") if _is_dicom_file(f)]
+    if not files:
+        raise InputError("No DICOM files found.")
+    # GDCM's series functions take a directory: stage numbered copies, then map each back to its original file.
+    staged = _stage_dicom(files, scratch / "series_scan")
+    series: List[DicomSeries] = []
+    for uid in sitk.ImageSeriesReader.GetGDCMSeriesIDs(str(staged)):
+        names = sitk.ImageSeriesReader.GetGDCMSeriesFileNames(str(staged), uid)
+        if not names:
+            continue
+        tags = _dicom_tags(Path(names[0]))
+        series.append(DicomSeries(
+            uid=uid,
+            description=tags["description"],
+            modality=tags["modality"],
+            series_number=tags["series_number"],
+            n_files=len(names),
+            files=[files[int(Path(n).stem)] for n in names],
+            is_t2w_fs=_is_t2w_fs(tags["description"], tags["protocol"]),
+        ))
+    if not series:
+        raise InputError("No readable DICOM series found.")
+    return series
 
 
-def _sa_from_playback_local(playback: torch.Tensor, in_tensor: torch.Tensor, grid: dict):
-    """Fallback replica of ``TransformerEncoderLayerWithAttn.sa_from_playback`` for environments without
-    ``pytorch_med_imaging`` (mock mode only).  Returns the prediction-token attention as ``(L, H, W, S)`` int16."""
-    from einops import rearrange
-    dev = in_tensor.device
-    sa = rearrange(playback[:, :, 0, 2:].to(dev), "b c (s w h) -> b c h w s", **grid)
-    sa = F.interpolate(sa, size=(in_tensor.shape[-3], in_tensor.shape[-2], grid["s"]),
-                       mode="trilinear", align_corners=False).float()
-    return (sa / sa.max() * 1000).type(torch.int16).squeeze().cpu().numpy()
+def _select_series(series: List[DicomSeries], series_uid: Optional[str]) -> DicomSeries:
+    """The series named by ``series_uid``; with no uid, the only series (ambiguous uploads raise)."""
+    if not series:
+        raise InputError("No readable DICOM series found.")
+    if series_uid is None:
+        if len(series) == 1:
+            return series[0]
+        options = "; ".join(f"{s.description or 'no description'} (series {s.series_number or '?'}, "
+                            f"{s.n_files} files, uid {s.uid})" for s in series)
+        raise InputError(f"The upload contains {len(series)} DICOM series; choose one: {options}.")
+    for s in series:
+        if s.uid == series_uid:
+            return s
+    raise InputError(f"DICOM series {series_uid} is not part of the upload.")
 
 
 def _attention_volume(playback: torch.Tensor, in_tensor: torch.Tensor, grid: dict) -> np.ndarray:
-    """Playback -> ``(layers, H, W, S)`` int16, using the repo's own ``sa_from_playback`` when importable."""
+    """Playback -> ``(layers, H, W, S)`` int16, using the repo's own ``sa_from_playback``."""
     try:
         _ensure_repo_paths()
         from rAIdiologist.config.network.lstm_rater import TransformerEncoderLayerWithAttn
-    except Exception as exc:                                  # pragma: no cover - depends on the environment
-        logger.info("Using local sa_from_playback replica (%s)", type(exc).__name__)
-        return _sa_from_playback_local(playback, in_tensor, grid)
+    except Exception as exc:
+        raise ModelUnavailableError(
+            f"Attention output needs pytorch_med_imaging (see ui/requirements-real.txt): {exc}") from exc
     pb_pred, _ = TransformerEncoderLayerWithAttn.sa_from_playback(playback, in_tensor, grid)
     return pb_pred.data.cpu().numpy()
 
@@ -365,15 +353,12 @@ _MODEL_LOCK = threading.Lock()
 _INFER_LOCK = threading.Lock()          # one inference at a time: protects the stateful playback buffers
 
 
-def load_model(mock: bool, device: torch.device, checkpoint: Optional[Union[str, Path]] = None) -> nn.Module:
-    key = (mock, str(device), str(checkpoint) if not mock else None)
+def load_model(device: torch.device, checkpoint: Optional[Union[str, Path]] = None) -> nn.Module:
+    key = (str(device), str(checkpoint))
     with _MODEL_LOCK:
         if key in _MODEL_CACHE:
             return _MODEL_CACHE[key]
-        if mock:
-            net: nn.Module = MockRAIdiologist()
-        else:
-            net = _load_real_model(Path(checkpoint or DEFAULT_CHECKPOINT))
+        net = _load_real_model(Path(checkpoint or DEFAULT_CHECKPOINT))
         net = net.to(device).eval()
         _MODEL_CACHE[key] = net
         return net
@@ -383,7 +368,7 @@ def _load_real_model(checkpoint: Path) -> nn.Module:
     if not checkpoint.is_file():
         raise ModelUnavailableError(
             f"rAIdiologist checkpoint not found: {checkpoint}. The weights are distributed under NDA, see "
-            f"models_weights/instructions-to-obtain-model-weights.md, or run with mock mode (NPC_UI_MOCK=1).")
+            f"models_weights/instructions-to-obtain-model-weights.md.")
     try:
         _ensure_repo_paths()
         from rAIdiologist.config.network.rAIdiologist import create_rAIdiologist_v5_1
@@ -413,11 +398,60 @@ def _load_real_model(checkpoint: Path) -> nn.Module:
 # --------------------------------------------------------------------------------------------------
 # Pre-processing and forward
 # --------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NetworkGrid:
+    """Geometry of the network-input grid, SimpleITK (LPS) convention.
+
+    Records the net effect of ``ToCanonical -> Resample('input') -> CropOrPad(PATCH_SIZE)``; that is all that is
+    needed to map a mask on the network grid back to physical space.
+    """
+    size: Tuple[int, int, int]
+    spacing: Tuple[float, float, float]
+    origin: Tuple[float, float, float]
+    direction: Tuple[float, ...]                # row-major 3x3, as SimpleITK expects
+
+
+def _network_grid(img) -> NetworkGrid:
+    """Read the grid geometry from a transformed torchio image (its affine maps RAS+ voxels to world)."""
+    affine = np.asarray(img.affine, dtype=np.float64)
+    spacing = np.linalg.norm(affine[:3, :3], axis=0)
+    direction_ras = affine[:3, :3] / spacing
+    ras_to_lps = np.diag([-1.0, -1.0, 1.0])
+    return NetworkGrid(
+        size=tuple(int(v) for v in img.spatial_shape),
+        spacing=tuple(float(v) for v in spacing),
+        origin=tuple(float(v) for v in ras_to_lps @ affine[:3, 3]),
+        direction=tuple(float(v) for v in (ras_to_lps @ direction_ras).ravel()),
+    )
+
+
+def inverse_map_segmentation(mask: np.ndarray, grid: NetworkGrid, reference: "sitk.Image") -> "sitk.Image":
+    """Back-project a tumour mask from the network grid onto the original input grid.
+
+    ``mask`` is ``(H, W, S)`` indexed like the network tensor (``grid.size``).  It is placed in physical space by
+    ``grid`` and resampled with nearest-neighbour onto ``reference`` (the input image as read by SimpleITK), so the
+    result has exactly the reference's size, spacing, origin and direction.  Voxels outside the network crop are 0.
+    Needs no model run: any mask on the network grid plus its :class:`NetworkGrid` can be passed.
+    """
+    import SimpleITK as sitk
+    if tuple(mask.shape) != grid.size:
+        raise ValueError(f"Mask shape {tuple(mask.shape)} does not match the network grid {grid.size}.")
+    seg = sitk.GetImageFromArray(np.ascontiguousarray(np.transpose(np.asarray(mask, dtype=np.uint8), (2, 1, 0))))
+    seg.SetSpacing(grid.spacing)
+    seg.SetOrigin(grid.origin)
+    seg.SetDirection(grid.direction)
+    return sitk.Resample(seg, reference, sitk.Transform(3, sitk.sitkIdentity), sitk.sitkNearestNeighbor, 0,
+                         sitk.sitkUInt8)
+
+
 def _prepare_tensor(nii_path: Path, seg_path: Optional[Path]):
     """Replicates rAIdiologist_transform_inf.yaml: ToCanonical -> Resample('input') -> CropOrPad(320,320,25).
 
-    Returns ``(tensor, seg)``: the network input ``(1, 1, 320, 320, 25)`` and, when a segmentation was given, the same
-    transform applied to it, ``(320, 320, 25)`` uint8, so it lines up voxel-for-voxel with the tensor.
+    Returns ``(tensor, seg, grid)``: the network input ``(1, 1, 320, 320, 25)``; the same transform applied to the
+    segmentation when one was given (``(320, 320, 25)`` uint8, voxel-aligned with the tensor, else None); and the
+    :class:`NetworkGrid` the tensor lives on, needed to map a mask back to the input space.
     """
     import torchio as tio
     images = {"input": tio.ScalarImage(str(nii_path))}
@@ -437,7 +471,7 @@ def _prepare_tensor(nii_path: Path, seg_path: Optional[Path]):
     seg = None
     if seg_path is not None:
         seg = (subject["probmap"].data[0] > 0).numpy().astype(np.uint8)
-    return subject["input"].data.float().unsqueeze(0), seg      # (1, 1, 320, 320, 25)
+    return subject["input"].data.float().unsqueeze(0), seg, _network_grid(subject["input"])      # (1, 1, 320, 320, 25)
 
 
 def _forward(net: nn.Module, tensor: torch.Tensor, with_attention: bool):
@@ -464,7 +498,7 @@ def _parse_scores(out: torch.Tensor) -> Tuple[float, List[float]]:
 
 
 # --------------------------------------------------------------------------------------------------
-# Real-mode preprocessing (normalisation / localisation via the repo's own CLI functions)
+# Preprocessing (normalisation / localisation via the repo's own CLI functions)
 # --------------------------------------------------------------------------------------------------
 def _real_preprocess(kind: str, files: List[Path], normalize: bool, work: Path, models_dir: Path,
                      warnings: List[str], progress: ProgressFn) -> Tuple[Path, Optional[Path], bool]:
@@ -514,66 +548,40 @@ def _real_preprocess(kind: str, files: List[Path], normalize: bool, work: Path, 
 # --------------------------------------------------------------------------------------------------
 # Public entry point
 # --------------------------------------------------------------------------------------------------
-def run_inference(
-    paths: Sequence[Union[str, Path]],
-    *,
-    normalize: bool = False,
-    with_attention: bool = True,
-    mock: Optional[bool] = None,
-    device: str = "auto",
-    checkpoint: Optional[Union[str, Path]] = None,
-    models_dir: Optional[Union[str, Path]] = None,
-    case_name: Optional[str] = None,
-    progress: Optional[ProgressFn] = None,
-) -> InferenceResult:
-    """Score one case.
+def _score_case(kind: str, files: List[Path], *, normalize: bool, with_attention: bool,
+                device: str, checkpoint, models_dir, case_name: Optional[str], series_uid: Optional[str],
+                progress: ProgressFn) -> InferenceResult:
+    """Score one case. ``files`` is ``[nifti]`` for kind ``"nifti"``, or the input files of one DICOM series for
+    kind ``"dicom"``."""
+    import SimpleITK as sitk
 
-    Args:
-        paths: uploaded file(s)/folder/zip; NIfTI or DICOM is auto-detected.
-        normalize: for NIfTI input only.  ``False`` = input is assumed already normalised.  DICOM is always
-            converted and normalised regardless of this flag.
-        with_attention: also return the self-attention volume (slower, more memory).
-        mock: use the fake network (default: env ``NPC_UI_MOCK``).
-        device: ``auto`` | ``cpu`` | ``cuda`` | ``mps``.
-    """
     t0 = time.time()
-    progress = progress or (lambda f, m: None)
-    mock = env_mock_default() if mock is None else mock
     models_dir = Path(models_dir or DEFAULT_MODELS_DIR)
     warnings: List[str] = []
+    if kind == "nifti":
+        _validate_nifti(files[0])
 
     with tempfile.TemporaryDirectory(prefix="npc_ui_") as tmp:
         work = Path(tmp)
-        progress(0.02, "Detecting input")
-        kind, files = detect_input(paths, work / "expand")
+        progress(0.02, "Preparing input")
         name = case_name or (files[0].parent.name if kind == "dicom" else files[0].name.split(".")[0])
+        reference: Optional[sitk.Image] = None     # input as read by SimpleITK: the original grid
+        if kind == "dicom":
+            series = list_dicom_series(files, work / "series")
+            files = _select_series(series, series_uid).files
+            reference = _read_dicom_series(files)
 
-        # The mock net is tiny and uses ops MPS lacks; keep it on CPU unless a device was requested explicitly.
-        dev = pick_device("cpu" if (mock and device == "auto") else device)
-        if mock:
-            warnings.append("MOCK MODE: score and attention are synthetic and carry no clinical meaning.")
-            seg_path = None
-            if kind == "dicom":
-                progress(0.1, "Converting DICOM")
-                nii = dicom_to_nifti(_stage_dicom(files, work / "dicom"), work / "converted.nii.gz")
-            else:
-                nii = files[0]
-            ran_norm = kind == "dicom" or normalize
-            if ran_norm:
-                progress(0.2, "Normalising (mock)")
-                nii = _mock_normalize(nii, work / "normalised.nii.gz")
-        else:
-            net_check = Path(checkpoint or DEFAULT_CHECKPOINT)
-            if not net_check.is_file():                                  # fail fast, before heavy work
-                raise ModelUnavailableError(
-                    f"rAIdiologist checkpoint not found: {net_check}. Weights are NDA-gated; use mock mode "
-                    f"(NPC_UI_MOCK=1) until you have them.")
-            nii, seg_path, ran_norm = _real_preprocess(kind, files, normalize, work, models_dir, warnings, progress)
+        dev = pick_device(device)
+        net_check = Path(checkpoint or DEFAULT_CHECKPOINT)
+        if not net_check.is_file():                                  # fail fast, before heavy work
+            raise ModelUnavailableError(
+                f"rAIdiologist checkpoint not found: {net_check}. Weights are NDA-gated.")
+        nii, seg_path, ran_norm = _real_preprocess(kind, files, normalize, work, models_dir, warnings, progress)
 
         progress(0.5, "Loading model")
-        net = load_model(mock, dev, checkpoint)
+        net = load_model(dev, checkpoint)
         progress(0.6, f"Running model on {dev}")
-        tensor, seg_full = _prepare_tensor(nii, seg_path)
+        tensor, seg_full, net_grid = _prepare_tensor(nii, seg_path)
         if (tensor.abs().sum(dim=(0, 1, 2, 3)) == 0).all():
             raise InputError("Image is empty after cropping / resampling.")
         tensor = tensor.to(dev)
@@ -587,20 +595,118 @@ def run_inference(
                     raise
                 warnings.append(f"MPS failed ({exc}); fell back to CPU.")
                 dev = torch.device("cpu")
-                net = load_model(mock, dev, checkpoint)
+                net = load_model(dev, checkpoint)
                 tensor = tensor.cpu()
                 out, attention = _forward(net, tensor, with_attention)
 
         score, raw = _parse_scores(out)
         volume = tensor[0, 0, :, :, 1:].cpu().numpy().astype(np.float32) if with_attention else None
         segmentation = seg_full[:, :, 1:] if (with_attention and seg_full is not None) else None   # same slice drop as volume
+        segmentation_image = None
+        if seg_full is not None:                    # full 25-slice mask: the dropped first slice is kept here
+            if reference is None:
+                reference = sitk.ReadImage(str(files[0]))
+            segmentation_image = inverse_map_segmentation(seg_full, net_grid, reference)
         progress(1.0, "Done")
         return InferenceResult(
-            case_id=name, score=score, decision=score >= DECISION_THRESHOLD, mode="mock" if mock else "real",
+            case_id=name, score=score, decision=score >= DECISION_THRESHOLD,
             device=str(dev), input_kind=kind, normalized=ran_norm, raw_outputs=raw,
             elapsed_s=time.time() - t0, warnings=warnings, volume=volume, attention=attention,
-            segmentation=segmentation,
+            segmentation=segmentation, segmentation_image=segmentation_image,
         )
+
+
+def run_inference(
+    paths: Sequence[Union[str, Path]],
+    *,
+    normalize: bool = False,
+    with_attention: bool = True,
+    device: str = "auto",
+    checkpoint: Optional[Union[str, Path]] = None,
+    models_dir: Optional[Union[str, Path]] = None,
+    case_name: Optional[str] = None,
+    series_uid: Optional[str] = None,
+    progress: Optional[ProgressFn] = None,
+) -> InferenceResult:
+    """Score one case.
+
+    Args:
+        paths: uploaded file(s)/folder/zip; NIfTI or DICOM is auto-detected. Several NIfTI files raise
+            :class:`InputError`; use :func:`run_inference_batch` to score them as separate cases.
+        normalize: for NIfTI input only.  ``False`` = input is assumed already normalised.  DICOM is always
+            converted and normalised regardless of this flag.
+        with_attention: also return the self-attention volume (slower, more memory).
+        device: ``auto`` | ``cpu`` | ``cuda`` | ``mps``.
+        series_uid: DICOM only.  UID of the series to score (from :func:`list_dicom_series`).  Required when the
+            upload holds several series (:class:`InputError` otherwise); ignored for NIfTI.
+    """
+    with tempfile.TemporaryDirectory(prefix="npc_ui_") as tmp:
+        kind, files = detect_input(paths, Path(tmp) / "expand")
+        if kind == "nifti" and len(files) > 1:
+            raise InputError(f"{len(files)} NIfTI files given; this entry point scores one case at a time. "
+                             "Use run_inference_batch for several cases.")
+        return _score_case(kind, files, normalize=normalize, with_attention=with_attention, device=device,
+                           checkpoint=checkpoint, models_dir=models_dir, case_name=case_name,
+                           series_uid=series_uid, progress=progress or (lambda f, m: None))
+
+
+def run_inference_batch(
+    paths: Sequence[Union[str, Path]],
+    *,
+    normalize: bool = False,
+    with_attention: bool = True,
+    device: str = "auto",
+    checkpoint: Optional[Union[str, Path]] = None,
+    models_dir: Optional[Union[str, Path]] = None,
+    series_uid: Optional[str] = None,
+    progress: Optional[ProgressFn] = None,
+) -> List[CaseOutcome]:
+    """Score every upload as its own case, in upload order. One CaseOutcome per NIfTI file, or one for a DICOM series.
+
+    Per-case failures (InputError, any other Exception) are captured in ``CaseOutcome.error`` and do not stop the
+    batch. ModelUnavailableError (missing checkpoint or dependency) is global and is re-raised, aborting the batch.
+    ``progress`` receives one overall fraction in [0, 1] and a "[i/n] message" text.
+    """
+    report: ProgressFn = progress or (lambda f, m: None)
+    outcomes: List[CaseOutcome] = []
+    with tempfile.TemporaryDirectory(prefix="npc_batch_") as tmp:
+        kind, files = detect_input(paths, Path(tmp) / "expand")
+        if kind == "dicom":
+            cases = [("DICOM series", files, series_uid)]
+        else:
+            cases = [(f.name, [f], None) for f in files]
+        n = len(cases)
+        for i, (name, case_files, uid) in enumerate(cases):
+            def case_progress(frac: float, msg: str, i: int = i) -> None:
+                report((i + frac) / n, f"[{i + 1}/{n}] {msg}")
+
+            try:
+                res = _score_case(kind, case_files, normalize=normalize, with_attention=with_attention,
+                                  device=device, checkpoint=checkpoint, models_dir=models_dir, case_name=None,
+                                  series_uid=uid, progress=case_progress)
+                outcomes.append(CaseOutcome(name=name, result=res))
+            except ModelUnavailableError:
+                raise
+            except InputError as exc:
+                outcomes.append(CaseOutcome(name=name, error=str(exc)))
+            except Exception as exc:
+                logger.exception("Case '%s' failed", name)
+                outcomes.append(CaseOutcome(name=name, error=f"{type(exc).__name__}: {exc}"))
+    report(1.0, "Done")
+    return outcomes
+
+
+def export_segmentation(res: InferenceResult, path: Union[str, Path]) -> Path:
+    """Write the tumour mask as NIfTI (``.nii`` / ``.nii.gz``) on the ORIGINAL input grid of ``res``."""
+    import SimpleITK as sitk
+    if res.segmentation_image is None:
+        raise ValueError("No segmentation to export (no localisation model available).")
+    path = Path(path)
+    if not _is_nifti(path):
+        raise ValueError(f"Segmentation must be written as .nii or .nii.gz, got '{path.name}'.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(res.segmentation_image, str(path))
+    return path
 
 
 # --------------------------------------------------------------------------------------------------
