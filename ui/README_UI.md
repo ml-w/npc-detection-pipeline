@@ -5,9 +5,9 @@ Two front-ends over one shared module, `inference_api.py`.
 | App | What it shows |
 |-----|---------------|
 | `app_gradio.py` | upload -> malignancy probability only |
-| `app_streamlit.py` | banner + README summary, upload and options in the main page (no sidebar), result card, slice browser / grid with self-attention overlay (opacity / threshold / layer mean-max-single), tumour outline from the localisation step, cached rendering. Run it from `ui/` so `.streamlit/config.toml` (theme) is used |
+| `app_streamlit.py` | banner + README summary, upload and options in the main page (no sidebar), batch of NIfTI cases with a case selector, result card, slice browser / grid with self-attention overlay (opacity / threshold / layer mean-max-single), tumour outline from the localisation step, cached rendering. Run it from `ui/` so `.streamlit/config.toml` (theme) is used |
 
-Input is auto-detected: one NIfTI (`.nii`/`.nii.gz`), or a DICOM series (files, folder or `.zip`).
+Input is auto-detected: one or more NIfTI files (each file is one case), or a DICOM series (files, folder or `.zip`).
 DICOM is always converted + normalised. For NIfTI the **normalisation checkbox** decides (unticked = the file is
 treated as already normalised).
 
@@ -39,6 +39,34 @@ I/O contract (`(B,1,320,320,S)` -> `(B,3,1)`, plus a `(1,20,T,T)`-style attentio
 and the same playback -> attention-volume path run unchanged. Scores and attention are **synthetic**; the UI says so.
 Switching to real weights needs no UI change: drop the `.pt` in `models_weights/` (or pass `checkpoint=`).
 Real mode is verified on the example cases: CLI, `inference_api`, Gradio and Streamlit give the same score.
+
+## DICOM series selection and segmentation download
+
+**Series selection.** When an upload contains more than one DICOM series, the Streamlit case card shows a
+*DICOM series* selectbox listing each series by description, file count and series number. The series whose
+SeriesDescription / ProtocolName look like T2w-fs (`list_dicom_series` sets `is_t2w_fs`) is preselected and marked
+"(T2w-fs)"; if none matches, the first series is preselected. Single-series uploads need no choice and show no
+selectbox. The Python API behaves the same way: an ambiguous upload raises `InputError` unless `series_uid` is given.
+
+**Segmentation download.** When a segmentation exists, the result card offers *Download segmentation (NIfTI)*
+(`<case_id>_segmentation.nii.gz`). `export_segmentation()` writes the tumour mask on the ORIGINAL input grid: the
+same voxel grid, spacing, origin and direction as the uploaded image, not the resampled network grid. The button
+only appears when `InferenceResult.segmentation_image` is set, so it is never shown in mock mode (no localisation
+runs there).
+
+## Batch of NIfTI files
+
+Upload several `.nii` / `.nii.gz` files and each one is scored as a separate case, in upload order. The same
+normalisation setting applies to all of them. The Streamlit page shows a summary table (file, case, P(malignant),
+decision, status) and a case selector; the result card, slices and downloads follow the selected case. A case that
+fails (for example a corrupt or non-3D file) is reported per case as an error and the other cases still run. The
+model is loaded once per batch. Each case has its own segmentation download (`<case_id>_segmentation.nii.gz`); all
+segmentations can also be downloaded at once as a ZIP, with members `<n>_<case_id>_segmentation.nii.gz` (`n` = upload
+position).
+
+Python API: `run_inference(paths)` scores one case and raises `InputError` on two or more NIfTI files;
+`run_inference_batch(paths)` scores every upload as its own case and returns a list of `CaseOutcome`
+(`name`, `result` or `error`, exactly one set).
 
 ## Notes
 

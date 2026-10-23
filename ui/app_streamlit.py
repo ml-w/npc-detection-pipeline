@@ -15,6 +15,7 @@ import math
 import sys
 import tempfile
 import uuid
+import zipfile
 from pathlib import Path
 
 import cv2
@@ -26,8 +27,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "discrimination_module" / "ui" / "results_viewer"))
 
-from inference_api import (InputError, ModelUnavailableError, axial_view, env_mock_default,  # noqa: E402
-                           reduce_attention, run_inference)
+from inference_api import (CaseOutcome, InputError, ModelUnavailableError, axial_view, env_mock_default,  # noqa: E402
+                           export_segmentation, list_dicom_series, reduce_attention, run_inference_batch)
 from visualization import apply_jet_colormap, draw_contour                                    # noqa: E402  (viewer)
 
 st.set_page_config(page_title="NPC Detection Pipeline", layout="wide", initial_sidebar_state="collapsed")
@@ -267,10 +268,54 @@ def _save_uploads(files) -> list:
     tmp = Path(tempfile.mkdtemp(prefix="npc_up_"))
     out = []
     for i, f in enumerate(files):
-        p = tmp / (f.name if f.name else f"file{i}")
+        d = tmp / str(i)                           # own folder per upload: equal file names do not overwrite
+        d.mkdir()
+        p = d / (f.name if f.name else f"file{i}")
         p.write_bytes(f.getbuffer())
         out.append(str(p))
     return out
+
+
+def _series_label(s) -> str:
+    label = f"{s.description or '(no description)'} · {s.n_files} files"
+    return f"{label} (T2w-fs)" if s.is_t2w_fs else label
+
+
+def _scan_uploads(files) -> dict:
+    """Save uploads once per distinct file set and list DICOM series (empty for NIfTI). Cached in session state."""
+    key = tuple((f.name, f.size) for f in files)
+    cached = st.session_state.get("scan")
+    if cached and cached["key"] == key:
+        return cached
+    scan = {"key": key, "paths": _save_uploads(files), "series": [], "error": None}
+    if not all(Path(p).name.lower().endswith((".nii", ".nii.gz")) for p in scan["paths"]):
+        try:
+            scan["series"] = list_dicom_series(scan["paths"], Path(tempfile.mkdtemp(prefix="npc_scan_")))
+        except InputError as exc:
+            scan["error"] = str(exc)
+        except Exception as exc:                                # surface unexpected failures, keep the app alive
+            scan["error"] = f"{type(exc).__name__}: {exc}"
+    st.session_state["scan"] = scan
+    return scan
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _seg_nifti(rid: str, _res) -> bytes:
+    """Segmentation NIfTI in the original input grid, as bytes for st.download_button."""
+    out = Path(tempfile.mkdtemp(prefix="npc_seg_")) / "segmentation.nii.gz"
+    return export_segmentation(_res, out).read_bytes()
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _segs_zip(run_id: str, _outcomes: list[CaseOutcome]) -> bytes:
+    """All segmentations of a batch in one ZIP; member names are unique by position."""
+    buf = io.BytesIO()
+    with tempfile.TemporaryDirectory(prefix="npc_segzip_") as d, zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, oc in enumerate(_outcomes):
+            if oc.result is not None and oc.result.segmentation_image is not None:
+                p = export_segmentation(oc.result, Path(d) / f"{i + 1:02d}_{oc.result.case_id}_segmentation.nii.gz")
+                zf.write(p, arcname=p.name)
+    return buf.getvalue()
 
 
 # ============================================================================================================
@@ -311,6 +356,18 @@ st.markdown('<div class="npc-section">Case</div>', unsafe_allow_html=True)
 with st.container(border=True):
     uploads = st.file_uploader("NIfTI (.nii/.nii.gz) or DICOM series (multiple files or .zip)",
                                accept_multiple_files=True)
+    st.markdown('<p class="npc-hint">Several NIfTI files are scored as separate cases (one result each).</p>',
+                unsafe_allow_html=True)
+    scan = _scan_uploads(uploads) if uploads else {"series": [], "error": None}
+    if scan["error"]:
+        st.error(scan["error"])
+    series = scan["series"]
+    series_uid = None
+    if len(series) > 1:
+        labels = {s.uid: _series_label(s) for s in series}
+        default = next((i for i, s in enumerate(series) if s.is_t2w_fs), 0)
+        series_uid = st.selectbox("DICOM series (choose the T2w-fs series)", options=list(labels), index=default,
+                                  format_func=labels.get, key=f"series_uid_{abs(hash(scan['key']))}")
     st.markdown('<p class="npc-hint">DICOM is always converted and normalised. A NIfTI straight from the scanner '
                 'needs normalisation: leave it ticked unless the file is already Nyul-normalised.</p>',
                 unsafe_allow_html=True)
@@ -327,31 +384,51 @@ with st.container(border=True):
 
 if run and uploads:
     bar = st.progress(0.0, text="Starting")
-    paths = _save_uploads(uploads)
+    paths = _scan_uploads(uploads)["paths"]
     try:
-        res = run_inference(paths, normalize=normalize, with_attention=True, mock=mock,
-                            progress=lambda frac, msg: bar.progress(min(frac, 1.0), text=msg))
-        st.session_state["result"] = res
-        st.session_state["result_id"] = uuid.uuid4().hex
+        outcomes = run_inference_batch(paths, normalize=normalize, with_attention=True, mock=mock,
+                                       series_uid=series_uid,
+                                       progress=lambda frac, msg: bar.progress(min(frac, 1.0), text=msg))
+        st.session_state["outcomes"] = outcomes
+        st.session_state["run_id"] = uuid.uuid4().hex
         st.session_state.pop("error", None)
     except (InputError, ModelUnavailableError) as exc:
-        st.session_state.pop("result", None)
+        st.session_state.pop("outcomes", None)
         st.session_state["error"] = str(exc)
     except Exception as exc:                                    # surface unexpected failures, keep the app alive
-        st.session_state.pop("result", None)
+        st.session_state.pop("outcomes", None)
         st.session_state["error"] = f"{type(exc).__name__}: {exc}"
     bar.empty()
 
 if st.session_state.get("error"):
     st.error(st.session_state["error"])
 
-res = st.session_state.get("result")
-if res is None:
+outcomes = st.session_state.get("outcomes")
+if not outcomes:
     if not st.session_state.get("error"):
         st.markdown('<p class="npc-hint">Results appear here after you run inference.</p>', unsafe_allow_html=True)
     _footer()
     st.stop()
-rid = st.session_state.get("result_id") or st.session_state.setdefault("result_id", uuid.uuid4().hex)
+run_id = st.session_state["run_id"]
+if len(outcomes) > 1:
+    st.dataframe(
+        [{"#": i + 1, "File": oc.name, "Case": oc.result.case_id if oc.result else "",
+          "P(malignant)": oc.result.score if oc.result else None,
+          "Decision": oc.result.label if oc.result else "", "Status": "ok" if oc.result else oc.error}
+         for i, oc in enumerate(outcomes)],
+        hide_index=True, width="stretch",
+        column_config={"P(malignant)": st.column_config.NumberColumn(format="%.3f")})
+    labels = {i: f"{i + 1}. {oc.name}" + ("" if oc.result else " (failed)") for i, oc in enumerate(outcomes)}
+    sel = st.selectbox("Case", options=list(labels), format_func=labels.get, key=f"case_{run_id}")
+else:
+    sel = 0
+oc = outcomes[sel]
+if oc.result is None:
+    st.error(oc.error)
+    _footer()
+    st.stop()
+res = oc.result
+rid = f"{run_id}:{sel}"          # per-case cache key: _window / _slice_img / _seg_nifti use it
 
 # ============================================================================================================
 # Result
@@ -360,6 +437,12 @@ st.markdown('<div class="npc-section">Result</div>', unsafe_allow_html=True)
 for w in res.warnings:
     st.warning(w)
 st.markdown(_result_card(res), unsafe_allow_html=True)
+if res.segmentation_image is not None:
+    st.download_button("Download segmentation (NIfTI)", data=_seg_nifti(rid, res),
+                       file_name=f"{res.case_id}_segmentation.nii.gz", mime="application/gzip")
+if len(outcomes) > 1 and any(o.result is not None and o.result.segmentation_image is not None for o in outcomes):
+    st.download_button("Download all segmentations (ZIP)", data=_segs_zip(run_id, outcomes),
+                       file_name=f"segmentations_{run_id[:8]}.zip", mime="application/zip")
 with st.expander("Raw network outputs"):
     st.write(dict(zip(["fused logit", "rnn confidence", "rnn-only logit"], [round(v, 3) for v in res.raw_outputs])))
 
