@@ -1,0 +1,17 @@
+# Picked up when `streamlit run` is started from the ui/ directory.
+# Palette follows img/banner.svg (violet accent, slate text).
+[theme]
+base = "light"
+primaryColor = "#796cbf"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f3fb"
+textColor = "#3b3d4d"
+font = "sans serif"
+baseRadius = "large"
+borderColor = "#e4e2f0"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false

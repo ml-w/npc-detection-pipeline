@@ -83,7 +83,7 @@ class rAIdiologistSolver(BinaryClassificationSolver):
                     result = self.net.load_pretrained_CNN(self.rAI_pretrained_CNN)
                 else:
                     self._logger.debug("Regular state load path")
-                    result = self.net.load_state_dict(torch.load(self.rAI_pretrained_CNN))
+                    result = self.net.load_state_dict(torch.load(self.rAI_pretrained_CNN, map_location='cpu'))
 
 
                 if str(result) != "<All keys matched successfully>":
