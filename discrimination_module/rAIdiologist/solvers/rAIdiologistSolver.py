@@ -363,7 +363,7 @@ class rAIdiologistInferencer(BinaryClassificationInferencer):
 
         self.net_handles = []
         if not self.rAI_pretrain_mode:
-            if self.rAI_inf_save_playbacks and not self.net._mode == 0:
+            if (self.rAI_inf_save_playbacks or self._dual_view_active()) and not self.net._mode == 0:
                 self._logger.info("Registering save playback hooks...")
                 self.net.RECORD_ON = True
                 self.net_handles.append(self.net.register_forward_pre_hook(_playback_clean_hook))
@@ -479,9 +479,9 @@ class rAIdiologistInferencer(BinaryClassificationInferencer):
                 else:
                     gt_list.append(None)
 
-                # Save playbacks if enabled
+                # Save playbacks if enabled, or always when the dual-view path is on (writes corrected SA map)
                 if hasattr(self.net, '_mode'):
-                    if self.rAI_inf_save_playbacks and not self.net._mode == 0:
+                    if (self.rAI_inf_save_playbacks or self._dual_view_active()) and not self.net._mode == 0:
                         self._save_playback(subject)
 
                         # clear the playbacks
@@ -514,6 +514,10 @@ class rAIdiologistInferencer(BinaryClassificationInferencer):
             self._dl = DataLabel(df)
             return self._dl
 
+    def _dual_view_active(self) -> bool:
+        r"""True when the half-patch dual-view inference path runs (flag on and radiology inference mode)."""
+        return bool(getattr(self.net, 'rai_dual_crop_inference', False)) and int(self.net._mode) in (2, 3, -1)
+
     def _save_playback(self, subject):
         """Save playback for a single subject"""
         uid = subject.get('uid', 'unknown')
@@ -532,8 +536,19 @@ class rAIdiologistInferencer(BinaryClassificationInferencer):
         grid_size = {
             'h': self.net._grid_size[0],
             'w': self.net._grid_size[0],
-            's': input_tensor.shape[-1] - 1
+            's': input_tensor.shape[-1] - 1,
+            'views': 2 if self._dual_view_active() else 1,
         }
+        if grid_size['views'] == 2:
+            h, w = grid_size['h'], grid_size['w']
+            self._logger.info(
+                f"Dual-crop SA reconstruction: views=2, coarse canvas per slice {(2 * h + 1)}x{(2 * w + 1)} "
+                f"before trilinear upsample to {input_tensor.shape[-3]}x{input_tensor.shape[-2]}"
+            )
+        else:
+            self._logger.warning(
+                "Dual-crop inactive for playback (flag off or mode not in 2|3|-1); using single 8x8 grid + trilinear."
+            )
 
         pb_pred, pb_conf = TransformerEncoderLayerWithAttn.sa_from_playback(playback, input_tensor, grid_size)
 

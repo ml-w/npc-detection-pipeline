@@ -336,7 +336,7 @@ st.markdown(CSS + (DARK_CSS if st.session_state["dark"] else ""), unsafe_allow_h
 _, theme_col = st.columns([10, 2])
 theme_col.button("Light mode" if st.session_state["dark"] else "Dark mode",
                  icon=":material/light_mode:" if st.session_state["dark"] else ":material/dark_mode:",
-                 on_click=_flip_theme, key="theme_btn", width="stretch")
+                 on_click=_flip_theme, key="theme_btn", use_container_width=True)
 
 hero_l, hero_r = st.columns([5, 7], gap="large", vertical_alignment="center")
 with hero_l:
@@ -375,14 +375,17 @@ with st.container(border=True):
             normalize = st.checkbox("Run intensity normalisation (NIfTI only)", value=True,
                                     help="Unticked = the NIfTI is treated as already normalised. DICOM is always "
                                          "converted and normalised.")
+            localize = st.checkbox("Run tumour segmentation (localisation)", value=True,
+                                   help="Independent of intensity normalisation. Unticked = centre-crop the volume "
+                                        "instead of a tumour-centred crop; no segmentation download / outline.")
     with opt_r:
-        run = st.button("Run inference", type="primary", width="stretch", disabled=not uploads)
+        run = st.button("Run inference", type="primary", use_container_width=True, disabled=not uploads)
 
 if run and uploads:
     bar = st.progress(0.0, text="Starting")
     paths = _scan_uploads(uploads)["paths"]
     try:
-        outcomes = run_inference_batch(paths, normalize=normalize, with_attention=True,
+        outcomes = run_inference_batch(paths, normalize=normalize, localize=localize, with_attention=True,
                                        series_uid=series_uid,
                                        progress=lambda frac, msg: bar.progress(min(frac, 1.0), text=msg))
         st.session_state["outcomes"] = outcomes
@@ -412,7 +415,7 @@ if len(outcomes) > 1:
           "P(malignant)": oc.result.score if oc.result else None,
           "Decision": oc.result.label if oc.result else "", "Status": "ok" if oc.result else oc.error}
          for i, oc in enumerate(outcomes)],
-        hide_index=True, width="stretch",
+        hide_index=True, use_container_width=True,
         column_config={"P(malignant)": st.column_config.NumberColumn(format="%.3f")})
 
 # ============================================================================================================
@@ -442,11 +445,11 @@ if show_case_dl or show_zip:
     if show_case_dl:
         dl_case.download_button("Download this case (NIfTI)", data=_seg_nifti(rid, res),
                                 file_name=f"{res.case_id}_segmentation.nii.gz", mime="application/gzip",
-                                width="stretch")
+                                use_container_width=True)
     if show_zip:
         dl_zip.download_button("Download all cases (ZIP)", data=_segs_zip(run_id, outcomes),
                                file_name=f"segmentations_{run_id[:8]}.zip", mime="application/zip",
-                               width="stretch")
+                               use_container_width=True)
 with st.expander("Raw network outputs"):
     st.write(dict(zip(["fused logit", "rnn confidence", "rnn-only logit"], [round(v, 3) for v in res.raw_outputs])))
 
@@ -495,16 +498,16 @@ try:
                 st.caption(f"No tumour outline on slice {k} (tumour on slices {seg_slices[0]}-{seg_slices[-1]}).")
             left, right = st.columns(2)
             plain = _slice_img(rid, res, None, k, win, bool(show_seg), 2, False, "", 0, (0, 0), 0.0)
-            left.image(plain, caption=f"Slice {k}", width="stretch")
+            left.image(plain, caption=f"Slice {k}", use_container_width=True)
             if show_attn:
                 over = _slice_img(rid, res, norm, k, win, bool(show_seg), 2, True, **attn_key)
-                right.image(over, caption=f"Self-attention overlay ({mode})", width="stretch")
+                right.image(over, caption=f"Self-attention overlay ({mode})", use_container_width=True)
                 right.markdown(_colour_bar(thr), unsafe_allow_html=True)
             else:
                 right.caption("Attention overlay is switched off.")
         else:
             grid = _grid_img(rid, res, norm if show_attn else None, win, bool(show_seg), bool(show_attn), **attn_key)
-            st.image(grid, caption=f"All {n_slices} slices", width="stretch")
+            st.image(grid, caption=f"All {n_slices} slices", use_container_width=True)
             if show_attn:
                 st.markdown(_colour_bar(thr), unsafe_allow_html=True)
 except ValueError as exc:                                                 # e.g. constant image in the window

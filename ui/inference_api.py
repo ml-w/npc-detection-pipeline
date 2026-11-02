@@ -9,8 +9,10 @@ Pipeline
    ``.zip``) is recognised automatically.
 2. **Normalisation**: DICOM is *always* converted to NIfTI and normalised; NIfTI is normalised only when
    ``normalize=True`` (unticked = the file is treated as already normalised).
-3. **Model**: rAIdiologist (CNN + Transformer rater) on CUDA / MPS / CPU (auto-selected).
-4. **Output**: malignancy probability and, optionally, the Transformer self-attention volume
+3. **Localisation** (optional, ``localize=True`` by default): tumour segmentation for tumour-centred crop.
+   Independent of the NIfTI normalisation checkbox; when skipped, the input is centre-cropped instead.
+4. **Model**: rAIdiologist (CNN + Transformer rater) on CUDA / MPS / CPU (auto-selected).
+5. **Output**: malignancy probability and, optionally, the Transformer self-attention volume
    (:class:`InferenceResult`).
 
 The network needs ``pytorch_med_imaging``, ``mnts`` (mri-normalization-tools) and the weights described in
@@ -501,7 +503,8 @@ def _parse_scores(out: torch.Tensor) -> Tuple[float, List[float]]:
 # Preprocessing (normalisation / localisation via the repo's own CLI functions)
 # --------------------------------------------------------------------------------------------------
 def _real_preprocess(kind: str, files: List[Path], normalize: bool, work: Path, models_dir: Path,
-                     warnings: List[str], progress: ProgressFn) -> Tuple[Path, Optional[Path], bool]:
+                     warnings: List[str], progress: ProgressFn, *,
+                     localize: bool = True) -> Tuple[Path, Optional[Path], bool]:
     """Returns ``(normalised_nifti, segmentation_or_None, normalisation_ran)``.  Unverified without weights."""
     try:
         _ensure_repo_paths()
@@ -528,17 +531,22 @@ def _real_preprocess(kind: str, files: List[Path], normalize: bool, work: Path, 
             ran_norm = True
         seg_ckpt = models_dir / "checkpoints" / "NPC_segment_T2WFS_v1.0.pt"
         seg_path: Optional[Path] = None
-        if seg_ckpt.is_file():
+        if localize and seg_ckpt.is_file():
             progress(0.35, "Localising tumour")
             cfg = NPCSegmentControllerCFG()
             cfg.run_mode, cfg.models_dir, cfg.sequence = "inference", str(models_dir), "T2WFS"
+            # huang_dir may be None when NIfTI normalisation was skipped; run_localize synthesises a fallback mask.
             seg_dir = cli.run_localize(nyul_dir, huang_dir, work / "seg", cfg, mlog,
                                        models_dir=models_dir, sequence="T2WFS")
             segs = sorted(Path(seg_dir).glob("*.nii.gz"))
             seg_path = segs[0] if segs else None
         if seg_path is None:
-            warnings.append("No segmentation available: the input is centre-cropped instead of tumour-centred, "
-                            "which can change the score.")
+            if not localize:
+                warnings.append("Localisation skipped: the input is centre-cropped instead of tumour-centred, "
+                                "which can change the score.")
+            else:
+                warnings.append("No segmentation available: the input is centre-cropped instead of tumour-centred, "
+                                "which can change the score.")
     niis = sorted(Path(nyul_dir).glob("*.nii*"))
     if not niis:
         raise RuntimeError("Normalisation produced no NIfTI output.")
@@ -548,9 +556,9 @@ def _real_preprocess(kind: str, files: List[Path], normalize: bool, work: Path, 
 # --------------------------------------------------------------------------------------------------
 # Public entry point
 # --------------------------------------------------------------------------------------------------
-def _score_case(kind: str, files: List[Path], *, normalize: bool, with_attention: bool,
-                device: str, checkpoint, models_dir, case_name: Optional[str], series_uid: Optional[str],
-                progress: ProgressFn) -> InferenceResult:
+def _score_case(kind: str, files: List[Path], *, normalize: bool, localize: bool,
+                with_attention: bool, device: str, checkpoint, models_dir, case_name: Optional[str],
+                series_uid: Optional[str], progress: ProgressFn) -> InferenceResult:
     """Score one case. ``files`` is ``[nifti]`` for kind ``"nifti"``, or the input files of one DICOM series for
     kind ``"dicom"``."""
     import SimpleITK as sitk
@@ -576,7 +584,8 @@ def _score_case(kind: str, files: List[Path], *, normalize: bool, with_attention
         if not net_check.is_file():                                  # fail fast, before heavy work
             raise ModelUnavailableError(
                 f"rAIdiologist checkpoint not found: {net_check}. Weights are NDA-gated.")
-        nii, seg_path, ran_norm = _real_preprocess(kind, files, normalize, work, models_dir, warnings, progress)
+        nii, seg_path, ran_norm = _real_preprocess(
+            kind, files, normalize, work, models_dir, warnings, progress, localize=localize)
 
         progress(0.5, "Loading model")
         net = load_model(dev, checkpoint)
@@ -620,6 +629,7 @@ def run_inference(
     paths: Sequence[Union[str, Path]],
     *,
     normalize: bool = False,
+    localize: bool = True,
     with_attention: bool = True,
     device: str = "auto",
     checkpoint: Optional[Union[str, Path]] = None,
@@ -635,6 +645,8 @@ def run_inference(
             :class:`InputError`; use :func:`run_inference_batch` to score them as separate cases.
         normalize: for NIfTI input only.  ``False`` = input is assumed already normalised.  DICOM is always
             converted and normalised regardless of this flag.
+        localize: run tumour localisation (segmentation) for a tumour-centred crop.  Independent of
+            ``normalize``; when ``False`` (or no localisation weights), the volume is centre-cropped.
         with_attention: also return the self-attention volume (slower, more memory).
         device: ``auto`` | ``cpu`` | ``cuda`` | ``mps``.
         series_uid: DICOM only.  UID of the series to score (from :func:`list_dicom_series`).  Required when the
@@ -645,7 +657,8 @@ def run_inference(
         if kind == "nifti" and len(files) > 1:
             raise InputError(f"{len(files)} NIfTI files given; this entry point scores one case at a time. "
                              "Use run_inference_batch for several cases.")
-        return _score_case(kind, files, normalize=normalize, with_attention=with_attention, device=device,
+        return _score_case(kind, files, normalize=normalize, localize=localize,
+                           with_attention=with_attention, device=device,
                            checkpoint=checkpoint, models_dir=models_dir, case_name=case_name,
                            series_uid=series_uid, progress=progress or (lambda f, m: None))
 
@@ -654,6 +667,7 @@ def run_inference_batch(
     paths: Sequence[Union[str, Path]],
     *,
     normalize: bool = False,
+    localize: bool = True,
     with_attention: bool = True,
     device: str = "auto",
     checkpoint: Optional[Union[str, Path]] = None,
@@ -681,7 +695,8 @@ def run_inference_batch(
                 report((i + frac) / n, f"[{i + 1}/{n}] {msg}")
 
             try:
-                res = _score_case(kind, case_files, normalize=normalize, with_attention=with_attention,
+                res = _score_case(kind, case_files, normalize=normalize, localize=localize,
+                                  with_attention=with_attention,
                                   device=device, checkpoint=checkpoint, models_dir=models_dir, case_name=None,
                                   series_uid=uid, progress=case_progress)
                 outcomes.append(CaseOutcome(name=name, result=res))

@@ -63,6 +63,9 @@ class Args:
 @click.option('--debug',
               is_flag=True,
               help="For debugging.")
+@click.option('--dual-crop/--no-dual-crop',
+              default=True,
+              help='Half-patch dual-view encoding for higher effective-resolution self-attention maps.')
 def main(**kwargs):
     r"""Easy-to-use cli for inferencing the network.
 
@@ -110,7 +113,8 @@ def main(**kwargs):
         )
         # Setup Inferencer CFG
         inferencer_cfg = rAIdiologistSolverCFG(
-            net                          = create_rAIdiologist_v5_1(),
+            net                          = create_rAIdiologist_v5_1(
+                rai_dual_crop_inference=args.dual_crop),
             batch_size                   = 8,
             unpack_key_inference         = ['input'],
             rAI_inf_save_playbacks       = True,
