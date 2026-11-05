@@ -442,7 +442,7 @@ class rAIdiologist_Transformer(rAIdiologist):
         dual = self._dual_view_inference_enabled()
         if dual:
             # Second encoding of the in-plane half-patch shifted input (S axis is not shifted)
-            _, x_shift = self.cnn(self._shift_inplane(x, x.shape[2] // 16, x.shape[3] // 16))
+            _, x_shift = self.cnn(self._shift_inplane(x, x.shape[2] // (2 * h), x.shape[3] // (2 * w)))
             x = self._interleave_views(x_cnn, x_shift)
         else:
             x = einops.rearrange(x_cnn, 'b c h w s -> b c (s w h)')
