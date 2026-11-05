@@ -11,23 +11,25 @@ import base64
 import html
 import io
 import math
+import shutil
 import sys
 import tempfile
 import uuid
 import zipfile
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
-
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "discrimination_module" / "ui" / "results_viewer"))
 
 from inference_api import (CaseOutcome, InputError, ModelUnavailableError, axial_view,  # noqa: E402
-                           export_segmentation, list_dicom_series, reduce_attention, run_inference_batch)
+                           clear_all_caches, cleanup_temp_dirs, export_segmentation,
+                           list_dicom_series, reduce_attention, run_inference_batch)
 from visualization import apply_jet_colormap, draw_contour                                    # noqa: E402  (viewer)
 
 st.set_page_config(page_title="NPC Detection Pipeline", layout="wide", initial_sidebar_state="collapsed")
@@ -128,7 +130,7 @@ button[kind="primary"]:disabled { opacity:.45; }
 
 # ============================================================================================================
 # Cached helpers.  Arrays that are large (the result volumes) are passed as ``_name`` arguments so Streamlit does
-# not hash them on every rerun; ``rid`` (one uuid per inference run) identifies them in the cache key.
+# not hash them on every rerun; ``input_hash`` (content hash of the input, stable across runs) identifies them.
 # ============================================================================================================
 @st.cache_resource(show_spinner=False)
 def _banner_uri() -> str:
@@ -142,7 +144,7 @@ def _jet_lut() -> np.ndarray:
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
-def _window(rid: str, _vol: np.ndarray, pct: tuple) -> tuple:
+def _window(input_hash: str, _vol: np.ndarray, pct: tuple) -> tuple:
     lo, hi = np.percentile(_vol, pct)
     if lo == hi:
         raise ValueError("Min point and Max point are the same")
@@ -150,7 +152,7 @@ def _window(rid: str, _vol: np.ndarray, pct: tuple) -> tuple:
 
 
 @st.cache_resource(show_spinner=False, max_entries=8)
-def _attention_norm(rid: str, _attn: np.ndarray, mode: str, layer: int) -> np.ndarray:
+def _attention_norm(input_hash: str, _attn: np.ndarray, mode: str, layer: int) -> np.ndarray:
     """Layers -> one (H, W, S) map, min-max scaled to [0, 1] over this case.  Same for every case, any score."""
     amap = reduce_attention(_attn, {"mean": "mean", "max": "max", "single layer": "head"}[mode], layer)
     lo, hi = float(amap.min()), float(amap.max())
@@ -206,13 +208,13 @@ def _jpeg(rgb: np.ndarray) -> bytes:
 
 
 @st.cache_data(show_spinner=False, max_entries=256)
-def _slice_img(rid: str, _res, _norm, k: int, win: tuple, outline: bool, scale: int,
+def _slice_img(input_hash: str, _res, _norm, k: int, win: tuple, outline: bool, scale: int,
                overlay: bool, mode: str, layer: int, thr: tuple, alpha: float) -> bytes:
     return _jpeg(_compose_slice(_res, _norm, k, win, thr, alpha, overlay, outline, scale))
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
-def _grid_img(rid: str, _res, _norm, win: tuple, outline: bool, overlay: bool,
+def _grid_img(input_hash: str, _res, _norm, win: tuple, outline: bool, overlay: bool,
               mode: str, layer: int, thr: tuple, alpha: float) -> bytes:
     n, pad = _res.volume.shape[-1], 2
     tiles = [np.pad(_compose_slice(_res, _norm, k, win, thr, alpha, overlay, outline, 1, label=str(k)),
@@ -262,16 +264,21 @@ def _footer() -> None:
                "radiologist review.")
 
 
-def _save_uploads(files) -> list:
+def _save_uploads(files) -> Tuple[List[str], Path]:
     tmp = Path(tempfile.mkdtemp(prefix="npc_up_"))
     out = []
-    for i, f in enumerate(files):
-        d = tmp / str(i)                           # own folder per upload: equal file names do not overwrite
-        d.mkdir()
-        p = d / (f.name if f.name else f"file{i}")
-        p.write_bytes(f.getbuffer())
-        out.append(str(p))
-    return out
+    try:
+        for i, f in enumerate(files):
+            d = tmp / str(i)                           # own folder per upload: equal file names do not overwrite
+            d.mkdir()
+            p = d / (f.name if f.name else f"file{i}")
+            p.write_bytes(f.getbuffer())
+            out.append(str(p))
+        return out, tmp
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
 
 
 def _series_label(s) -> str:
@@ -285,23 +292,29 @@ def _scan_uploads(files) -> dict:
     cached = st.session_state.get("scan")
     if cached and cached["key"] == key:
         return cached
-    scan = {"key": key, "paths": _save_uploads(files), "series": [], "error": None}
+    paths, up_dir = _save_uploads(files)
+    scan = {"key": key, "paths": paths, "up_dir": up_dir, "series": [], "error": None}
     if not all(Path(p).name.lower().endswith((".nii", ".nii.gz")) for p in scan["paths"]):
         try:
-            scan["series"] = list_dicom_series(scan["paths"], Path(tempfile.mkdtemp(prefix="npc_scan_")))
+            scan_dir = Path(tempfile.mkdtemp(prefix="npc_scan_"))
+            scan["scan_dir"] = scan_dir
+            scan["series"] = list_dicom_series(scan["paths"], scan_dir)
         except InputError as exc:
             scan["error"] = str(exc)
         except Exception as exc:                                # surface unexpected failures, keep the app alive
             scan["error"] = f"{type(exc).__name__}: {exc}"
     st.session_state["scan"] = scan
+    st.session_state["cleanup"].dirs.extend([up_dir] + ([scan["scan_dir"]] if "scan_dir" in scan else []))
     return scan
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def _seg_nifti(rid: str, _res) -> bytes:
+def _seg_nifti(input_hash: str, _res) -> bytes:
     """Segmentation NIfTI in the original input grid, as bytes for st.download_button."""
-    out = Path(tempfile.mkdtemp(prefix="npc_seg_")) / "segmentation.nii.gz"
-    return export_segmentation(_res, out).read_bytes()
+    with tempfile.TemporaryDirectory(prefix="npc_seg_") as tmp:
+        out = Path(tmp) / "segmentation.nii.gz"
+        return export_segmentation(_res, out).read_bytes()
+
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -318,7 +331,21 @@ def _segs_zip(run_id: str, _outcomes: list[CaseOutcome]) -> bytes:
 
 # ============================================================================================================
 # Header + input
-# ============================================================================================================
+class SessionCleanup:
+    """Removes temporary directories when the Streamlit session object is garbage collected."""
+    def __init__(self, dirs: List[Path]):
+        self.dirs = dirs
+
+    def __del__(self):
+        for d in self.dirs:
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
+
+
+if "cleanup" not in st.session_state:
+    st.session_state["cleanup"] = SessionCleanup([])
+
+
 if "dark" not in st.session_state:                                  # ?theme=dark survives page reloads
     st.session_state["dark"] = st.query_params.get("theme") == "dark"
 
@@ -333,10 +360,24 @@ def _flip_theme() -> None:
 
 st.markdown(CSS + (DARK_CSS if st.session_state["dark"] else ""), unsafe_allow_html=True)
 
-_, theme_col = st.columns([10, 2])
-theme_col.button("Light mode" if st.session_state["dark"] else "Dark mode",
-                 icon=":material/light_mode:" if st.session_state["dark"] else ":material/dark_mode:",
-                 on_click=_flip_theme, key="theme_btn", use_container_width=True)
+
+with st.sidebar:
+    st.header("Settings")
+    if st.button("Clear all caches", icon=":material/delete_sweep:", key="clear_cache_btn",
+                 help="Clear memory/disk caches and reset results if you see inconsistent outputs.",
+                 use_container_width=True):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        clear_all_caches()
+        n_removed = cleanup_temp_dirs()
+        st.session_state.pop("outcomes", None)
+        st.session_state.pop("error", None)
+        st.success(f"All caches cleared and {n_removed} temp dirs removed.")
+        st.rerun()
+    st.divider()
+    st.button("Light mode" if st.session_state["dark"] else "Dark mode",
+              icon=":material/light_mode:" if st.session_state["dark"] else ":material/dark_mode:",
+              on_click=_flip_theme, key="theme_btn", use_container_width=True)
 
 hero_l, hero_r = st.columns([5, 7], gap="large", vertical_alignment="center")
 with hero_l:
@@ -378,14 +419,19 @@ with st.container(border=True):
             localize = st.checkbox("Run tumour segmentation (localisation)", value=True,
                                    help="Independent of intensity normalisation. Unticked = centre-crop the volume "
                                         "instead of a tumour-centred crop; no segmentation download / outline.")
+            dual_crop = st.checkbox("Run dual-crop inference", value=False,
+                                    help="Half-patch dual-view encoding for higher effective-resolution self-attention maps.")
     with opt_r:
         run = st.button("Run inference", type="primary", use_container_width=True, disabled=not uploads)
 
 if run and uploads:
     bar = st.progress(0.0, text="Starting")
-    paths = _scan_uploads(uploads)["paths"]
+    scan_data = _scan_uploads(uploads)
+    paths = scan_data["paths"]
     try:
-        outcomes = run_inference_batch(paths, normalize=normalize, localize=localize, with_attention=True,
+        outcomes = run_inference_batch(paths, normalize=normalize, localize=localize,
+                                       rai_dual_crop_inference=dual_crop,
+                                       with_attention=True,
                                        series_uid=series_uid,
                                        progress=lambda frac, msg: bar.progress(min(frac, 1.0), text=msg))
         st.session_state["outcomes"] = outcomes
@@ -398,6 +444,7 @@ if run and uploads:
         st.session_state.pop("outcomes", None)
         st.session_state["error"] = f"{type(exc).__name__}: {exc}"
     bar.empty()
+
 
 if st.session_state.get("error"):
     st.error(st.session_state["error"])
@@ -433,7 +480,8 @@ if oc.result is None:
     _footer()
     st.stop()
 res = oc.result
-rid = f"{run_id}:{sel}"          # per-case cache key: _window / _slice_img / _seg_nifti use it
+rid = f"{res.input_hash}:dual={int(res.dual_crop)}:norm={res.normalized}:seg={res.segmentation is not None}"
+
 for w in res.warnings:
     st.warning(w)
 st.markdown(_result_card(res), unsafe_allow_html=True)
@@ -456,61 +504,67 @@ with st.expander("Raw network outputs"):
 # ============================================================================================================
 # Viewer
 # ============================================================================================================
-st.markdown('<div class="npc-section">Self-attention viewer</div>', unsafe_allow_html=True)
-vol, attn, seg = res.volume, res.attention, res.segmentation
-n_slices, n_layers = vol.shape[-1], attn.shape[0]
-seg_slices = np.flatnonzero(seg.any(axis=(0, 1))) if seg is not None else np.array([], dtype=int)
-default_k = int(np.argmax(seg.sum(axis=(0, 1)))) if len(seg_slices) else n_slices // 2
+@st.fragment
+def render_viewer(res, rid):
+    """Self-attention viewer. A fragment: widget changes here rerun only this function, not the whole script."""
+    st.markdown('<div class="npc-section">Self-attention viewer</div>', unsafe_allow_html=True)
+    vol, attn, seg = res.volume, res.attention, res.segmentation
+    n_slices, n_layers = vol.shape[-1], attn.shape[0]
+    seg_slices = np.flatnonzero(seg.any(axis=(0, 1))) if seg is not None else np.array([], dtype=int)
+    default_k = int(np.argmax(seg.sum(axis=(0, 1)))) if len(seg_slices) else n_slices // 2
 
-view_col, ctrl_col = st.columns([3, 1], gap="large")
-with ctrl_col:
-    with st.container(border=True):
-        st.markdown("**Attention overlay**")
-        show_attn = st.checkbox("Show attention overlay", value=True)
-        mode = st.radio("Attention layers", ["mean", "max", "single layer"], horizontal=True)
-        layer = int(st.number_input("Layer", 0, n_layers - 1, n_layers - 1, disabled=(mode != "single layer")))
-        thr = st.slider("Attention threshold (0-255)", 0, 255, (40, 255),
-                        help="0-255 = 0-100% of this case's maximum attention, over all slices. Below the lower value "
-                             "is transparent; the colour reaches full red at the upper value.")
-        alpha = st.slider("Attention opacity", 0.0, 1.0, 0.5, 0.05)
-        st.markdown("**Tumour outline**")
-        show_seg = st.checkbox("Show tumour outline", value=bool(len(seg_slices)), disabled=not len(seg_slices))
-        if seg is None:
-            st.caption("No segmentation was produced for this run (no localisation model).")
-        elif not len(seg_slices):
-            st.caption("The localisation model found no tumour (empty segmentation): nothing to outline.")
-        else:
-            st.caption(f"Tumour located on slices {seg_slices[0]}-{seg_slices[-1]}.")
-        st.markdown("**Image**")
-        win_pct = st.slider("Image window (percentile)", 0, 99, (25, 99))
-    st.caption("Attention is scaled per case (min-max) and mapped blue to red. Colours show where the model looked "
-               "within this case, not an absolute strength, and never depend on the score.")
-
-try:
-    win = _window(rid, vol, tuple(win_pct))
-    norm = _attention_norm(rid, attn, mode, layer)
-    attn_key = dict(mode=mode, layer=layer, thr=tuple(thr), alpha=float(alpha))
-    with view_col:
-        view = st.radio("View", ["Single slice", "All slices (grid)"], horizontal=True)
-        if view == "Single slice":
-            k = st.slider("Slice", 0, n_slices - 1, default_k, key=f"slice_{rid}")
-            if len(seg_slices) and show_seg and k not in seg_slices:
-                st.caption(f"No tumour outline on slice {k} (tumour on slices {seg_slices[0]}-{seg_slices[-1]}).")
-            left, right = st.columns(2)
-            plain = _slice_img(rid, res, None, k, win, bool(show_seg), 2, False, "", 0, (0, 0), 0.0)
-            left.image(plain, caption=f"Slice {k}", use_container_width=True)
-            if show_attn:
-                over = _slice_img(rid, res, norm, k, win, bool(show_seg), 2, True, **attn_key)
-                right.image(over, caption=f"Self-attention overlay ({mode})", use_container_width=True)
-                right.markdown(_colour_bar(thr), unsafe_allow_html=True)
+    view_col, ctrl_col = st.columns([3, 1], gap="large")
+    with ctrl_col:
+        with st.container(border=True):
+            st.markdown("**Attention overlay**")
+            show_attn = st.checkbox("Show attention overlay", value=True)
+            mode = st.radio("Attention layers", ["mean", "max", "single layer"], horizontal=True)
+            layer = int(st.number_input("Layer", 0, n_layers - 1, n_layers - 1, disabled=(mode != "single layer")))
+            thr = st.slider("Attention threshold (0-255)", 0, 255, (40, 255),
+                            help="0-255 = 0-100% of this case's maximum attention, over all slices. Below the lower value "
+                                 "is transparent; the colour reaches full red at the upper value.")
+            alpha = st.slider("Attention opacity", 0.0, 1.0, 0.5, 0.05)
+            st.markdown("**Tumour outline**")
+            show_seg = st.checkbox("Show tumour outline", value=bool(len(seg_slices)), disabled=not len(seg_slices))
+            if seg is None:
+                st.caption("No segmentation was produced for this run (no localisation model).")
+            elif not len(seg_slices):
+                st.caption("The localisation model found no tumour (empty segmentation): nothing to outline.")
             else:
-                right.caption("Attention overlay is switched off.")
-        else:
-            grid = _grid_img(rid, res, norm if show_attn else None, win, bool(show_seg), bool(show_attn), **attn_key)
-            st.image(grid, caption=f"All {n_slices} slices", use_container_width=True)
-            if show_attn:
-                st.markdown(_colour_bar(thr), unsafe_allow_html=True)
-except ValueError as exc:                                                 # e.g. constant image in the window
-    st.error(f"Cannot render: {exc}")
+                st.caption(f"Tumour located on slices {seg_slices[0]}-{seg_slices[-1]}.")
+            st.markdown("**Image**")
+            win_pct = st.slider("Image window (percentile)", 0, 99, (25, 99))
+        st.caption("Attention is scaled per case (min-max) and mapped blue to red. Colours show where the model looked "
+                   "within this case, not an absolute strength, and never depend on the score.")
+
+    try:
+        win = _window(rid, vol, tuple(win_pct))
+        norm = _attention_norm(rid, attn, mode, layer)
+        attn_key = dict(mode=mode, layer=layer, thr=tuple(thr), alpha=float(alpha))
+        with view_col:
+            view = st.radio("View", ["Single slice", "All slices (grid)"], horizontal=True)
+            if view == "Single slice":
+                k = st.slider("Slice", 0, n_slices - 1, default_k, key=f"slice_{rid}")
+                if len(seg_slices) and show_seg and k not in seg_slices:
+                    st.caption(f"No tumour outline on slice {k} (tumour on slices {seg_slices[0]}-{seg_slices[-1]}).")
+                left, right = st.columns(2)
+                plain = _slice_img(rid, res, None, k, win, bool(show_seg), 2, False, "", 0, (0, 0), 0.0)
+                left.image(plain, caption=f"Slice {k}", use_container_width=True)
+                if show_attn:
+                    over = _slice_img(rid, res, norm, k, win, bool(show_seg), 2, True, **attn_key)
+                    right.image(over, caption=f"Self-attention overlay ({mode})", use_container_width=True)
+                    right.markdown(_colour_bar(thr), unsafe_allow_html=True)
+                else:
+                    right.caption("Attention overlay is switched off.")
+            else:
+                grid = _grid_img(rid, res, norm if show_attn else None, win, bool(show_seg), bool(show_attn), **attn_key)
+                st.image(grid, caption=f"All {n_slices} slices", use_container_width=True)
+                if show_attn:
+                    st.markdown(_colour_bar(thr), unsafe_allow_html=True)
+    except ValueError as exc:                                             # e.g. constant image in the window
+        st.error(f"Cannot render: {exc}")
+
+
+render_viewer(res, rid)
 
 _footer()
