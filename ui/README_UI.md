@@ -57,6 +57,29 @@ Python API: `run_inference(paths)` scores one case and raises `InputError` on tw
 `run_inference_batch(paths)` scores every upload as its own case and returns a list of `CaseOutcome`
 (`name`, `result` or `error`, exactly one set).
 
+## Dual-crop Inference
+
+The **Advanced** expander in the Streamlit app has **Run dual-crop inference** (default off). It enables the
+half-patch dual-view encoding (`rai_dual_crop_inference`), which encodes the input twice (the second time shifted by
+half a CNN patch) and merges both onto a finer `(2h+1) x (2w+1)` canvas, giving higher-resolution self-attention
+maps. It only takes effect for inference modes `(2, 3, -1)`. **Run tumour segmentation** (localisation) is in the
+same expander and is independent of normalisation. The flag is part of the model and result cache keys, and
+`InferenceResult.dual_crop` reports whether the path was active. Python API: pass
+`rai_dual_crop_inference=True` to `run_inference` / `run_inference_batch`.
+
+## Caching & Performance
+
+* Cache keys are content-addressable: SHA-256 of the input file (DICOM: sorted per-file hashes) and of the weights,
+  not file names or per-run UUIDs. Re-running the same case, even with a different upload name, reuses results.
+* Preprocessing (normalisation / segmentation) is cached on disk under `~/.cache/npc-pipeline/preprocess/`.
+* Models (max 8) and inference results (LRU, max 32) are cached in memory; the file-hash memo holds up to 1000 entries.
+* Streamlit rendering caches key on the input hash (plus flags), so slices/grids are reused across runs of the same
+  case, and changing opacity/threshold does not re-run inference.
+* **Clear all caches** (sidebar) clears the Streamlit caches, the in-memory model/inference/hash caches, the disk
+  preprocessing cache and leftover `npc_*` temp directories, and resets the shown results. Use it if outputs look
+  inconsistent.
+* Temporary upload/scan directories are removed automatically when the session ends.
+
 ## Notes
 
 * Score = `sigmoid(out[:, 0])`. The network actually emits 3 channels (fused logit, RNN confidence, RNN-only
