@@ -521,14 +521,15 @@ class TransformerEncoderLayerWithAttn(nn.TransformerEncoderLayer):
             raise RuntimeError(f"In correct type {type(in_tensor) = }. Expect torch.Tensor or shape")
 
         # Interpolate reshaped playback data to match input tensor size (in-plane H x W, slices = grid_size['s'])
+        align = grid_size.get('views', 1) == 2
         sa_for_prediction_resized = F.interpolate(
             sa_for_prediction, size=(in_tensor[-3], in_tensor[-2], grid_size['s']),
-            mode='trilinear', align_corners=False
+            mode='trilinear', align_corners=align
         ).float()
 
         sa_for_confidence_resized = F.interpolate(
             sa_for_confidence, size=(in_tensor[-3], in_tensor[-2], grid_size['s']),
-            mode='trilinear', align_corners=False
+            mode='trilinear', align_corners=align
         ).float()
 
         # Create TorchIO images for input, prediction, and confidence. Normalize them to range 0-1000
@@ -555,11 +556,11 @@ class TransformerEncoderLayerWithAttn(nn.TransformerEncoderLayer):
         Hc, Wc = 2 * h + 1, 2 * w + 1
         canvas = v.new_zeros(B, C, Hc, Wc, s)
         canvas[:, :, 1::2, 1::2] = v[:, :, 0]
-        canvas[:, :, 2::2, 2::2] = v[:, :, 1]
+        canvas[:, :, 0:-1:2, 0:-1:2] = v[:, :, 1]
 
         mask = torch.zeros(1, 1, Hc, Wc, dtype=v.dtype, device=v.device)
         mask[..., 1::2, 1::2] = 1
-        mask[..., 2::2, 2::2] = 1
+        mask[..., 0:-1:2, 0:-1:2] = 1
 
         # Treat slices as batch for 2D neighbourhood filling
         flat = canvas.permute(0, 1, 4, 2, 3).reshape(-1, 1, Hc, Wc)

@@ -535,7 +535,7 @@ class rAIdiologistInferencer(BinaryClassificationInferencer):
         # Convert self-attention
         grid_size = {
             'h': self.net._grid_size[0],
-            'w': self.net._grid_size[0],
+            'w': self.net._grid_size[1],
             's': input_tensor.shape[-1] - 1,
             'views': 2 if self._dual_view_active() else 1,
         }
@@ -645,8 +645,9 @@ class rAIdiologistInferencer(BinaryClassificationInferencer):
                             # convert self-attention
                             grid_size = {
                                 'h': self.net._grid_size[0],
-                                'w': self.net._grid_size[0],
-                                's': s.shape[-1] - 1
+                                'w': self.net._grid_size[1],
+                                's': s.shape[-1] - 1,
+                                'views': 2 if self._dual_view_active() else 1
                             }
                             pb_pred, pb_conf = TransformerEncoderLayerWithAttn.sa_from_playback(p, s, grid_size)
                             # now it's very difficult to map the SA to original space, so I'll just save it like this
