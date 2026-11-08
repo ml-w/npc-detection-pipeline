@@ -429,6 +429,10 @@ with st.container(border=True):
         default = next((i for i, s in enumerate(series) if s.is_t2w_fs), 0)
         series_uid = st.selectbox("DICOM series (choose the T2w-fs series)", options=list(labels), index=default,
                                   format_func=labels.get, key=f"series_uid_{abs(hash(scan['key']))}")
+    with opt_l:
+        with st.expander("Advanced"):
+            st.markdown('<p class="npc-hint">DICOM is always converted and normalised. A NIfTI straight from the '
+                        'scanner needs normalisation: leave it ticked unless the file is already '
                         'Nyul-normalised.</p>', unsafe_allow_html=True)
             normalize = st.checkbox("Run intensity normalisation (NIfTI only)", value=True,
                                     help="Unticked = the NIfTI is treated as already normalised. DICOM is always "
