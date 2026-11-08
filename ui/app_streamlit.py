@@ -30,8 +30,8 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "discrimination_module" / "ui" / "results_viewer"))
 
 from inference_api import (CaseOutcome, InputError, ModelUnavailableError, axial_view,  # noqa: E402
-                           clear_all_caches, cleanup_temp_dirs, detect_input_summary, export_segmentation,
-                           list_dicom_series, reduce_attention, run_inference_batch)
+                           clear_all_caches, cleanup_temp_dirs, detect_input, detect_input_summary,
+                           export_segmentation, list_dicom_series, reduce_attention, run_inference_batch)
 from visualization import apply_jet_colormap, draw_contour                                    # noqa: E402  (viewer)
 
 # accept_multiple_files="directory" (folder upload) exists since Streamlit 1.49.0; older versions raise a TypeError.
