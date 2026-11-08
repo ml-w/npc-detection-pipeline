@@ -30,3 +30,5 @@ docs/
 .claude
 CLAUDE.md
 .omp/
+models_weights/Normalization-T2w-fs
+models_weights/checkpoints
