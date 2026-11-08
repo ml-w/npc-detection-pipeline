@@ -7,39 +7,47 @@ import sys
 from pathlib import Path
 
 import gradio as gr
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from inference_api import InputError, ModelUnavailableError, run_inference  # noqa: E402
+from inference_api import InputError, ModelUnavailableError, run_inference_batch
 
 
 def predict(files, normalize, progress=gr.Progress()):
     if not files:
-        raise gr.Error("Please upload a NIfTI file or a DICOM series (files or .zip).")
+        return []
     paths = [f if isinstance(f, str) else f.name for f in files]
     try:
-        res = run_inference(paths, normalize=normalize, with_attention=False,
-                            progress=lambda frac, msg: progress(frac, desc=msg))
+        outcomes = run_inference_batch(paths, normalize=normalize, all_series=True,
+                                       progress=lambda frac, msg: progress(frac, desc=msg))
     except (InputError, ModelUnavailableError) as exc:
         raise gr.Error(str(exc))
-    except Exception as exc:                                  # unexpected: still show a readable message
+    except Exception as exc:
         raise gr.Error(f"Inference failed: {type(exc).__name__}: {str(exc)[:200]}")
-    notes = "\n".join(res.warnings)
-    return (f"{res.score:.4f}", res.label,
-            f"{res.summary()}\ninput={res.input_kind}, normalised in this run={res.normalized}"
-            + (f"\n{notes}" if notes else ""))
+
+    rows = []
+    for o in outcomes:
+        if o.error:
+            rows.append([o.name, "Error", "", o.error])
+        else:
+            rows.append([o.name, o.result.label, f"{o.result.score:.4f}", o.result.summary()])
+    return rows
 
 
 def build() -> gr.Blocks:
     with gr.Blocks(title="NPC rAIdiologist") as demo:
         gr.Markdown("# NPC rAIdiologist - malignancy score\nResearch use only; not a clinical device.")
-        files = gr.File(label="NIfTI (.nii/.nii.gz) or DICOM series (files / .zip)", file_count="multiple")
+        with gr.Row():
+            up_mode = gr.Radio(["Files", "Folder"], value="Files", label="Upload mode")
+            files = gr.File(label="NIfTI (.nii/.nii.gz) or DICOM series", file_count="multiple")
+
+        def update_file_count(mode):
+            return gr.File(file_count="directory" if mode == "Folder" else "multiple")
+
+        up_mode.change(update_file_count, up_mode, files)
+
         normalize = gr.Checkbox(label="Run intensity normalisation (NIfTI only; unticked = already normalised. "
-                                      "DICOM is always normalised)", value=False)
+                                      "DICOM is always normalised)", value=True)
         btn = gr.Button("Run", variant="primary")
-        score = gr.Textbox(label="Malignancy probability", interactive=False)
-        label = gr.Textbox(label="Result", interactive=False)
-        info = gr.Textbox(label="Details", interactive=False, lines=3)
-        btn.click(predict, [files, normalize], [score, label, info])
+        results = gr.Dataframe(headers=["Case", "Result", "Score", "Details"], label="Inference Results")
+        btn.click(predict, [files, normalize], [results])
     return demo
 
 

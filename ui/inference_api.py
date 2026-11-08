@@ -225,10 +225,12 @@ def _is_nifti(p: Path) -> bool:
 
 
 def _is_dicom_file(p: Path) -> bool:
-    if p.suffix.lower() in {".dcm", ".ima"}:
-        return True
-    if p.suffix and p.suffix.lower() not in {""}:
-        # Extension present and not a DICOM one: only sniff files without a suffix.
+    """True when ``p`` carries the ``DICM`` magic at offset 128.
+
+    PACS exports often use UID-based names without a ``.dcm`` suffix (or with dotted UID "suffixes"), so the
+    extension is never trusted: every file that is not already identified as NIfTI / Zip is sniffed.
+    """
+    if _is_nifti(p) or p.suffix.lower() == ".zip":
         return False
     try:
         with open(p, "rb") as fh:
@@ -306,6 +308,34 @@ def detect_input(paths: Sequence[Union[str, Path]], scratch: Path) -> Tuple[str,
         return "dicom", dicoms
     raise InputError("Unsupported input. Provide one or more .nii/.nii.gz files or a DICOM series "
                      "(files, folder or .zip).")
+
+
+def detect_input_summary(paths: List[Path], series: Optional[List[DicomSeries]] = None) -> dict:
+    """Count the uploaded files by kind: ``{"nifti", "dicom", "zip", "other", "series"}``.
+
+    ``paths`` are the files as given (no archive expansion).  ``series`` is the number of DICOM series, obtained
+    from :func:`list_dicom_series` when DICOM files (or zip archives that may contain them) are present; pass an
+    already-computed ``series`` list to avoid scanning twice.  Unreadable / DICOM-less inputs count 0 series.
+    """
+    counts = {"nifti": 0, "dicom": 0, "zip": 0, "other": 0, "series": 0}
+    for raw in paths:
+        p = Path(raw)
+        if _is_nifti(p):
+            counts["nifti"] += 1
+        elif p.suffix.lower() == ".zip":
+            counts["zip"] += 1
+        elif _is_dicom_file(p):
+            counts["dicom"] += 1
+        else:
+            counts["other"] += 1
+    if series is None and (counts["dicom"] or counts["zip"]):
+        with tempfile.TemporaryDirectory(prefix="npc_scan_") as scratch:
+            try:
+                series = list_dicom_series(paths, Path(scratch))
+            except InputError:
+                series = []
+    counts["series"] = len(series or [])
+    return counts
 
 
 # --------------------------------------------------------------------------------------------------
@@ -927,7 +957,8 @@ def run_inference_batch(
     device: str = "auto",
     checkpoint: Optional[Union[str, Path]] = None,
     models_dir: Optional[Union[str, Path]] = None,
-    series_uid: Optional[Union[str, str]] = None,
+    series_uid: Optional[str] = None,
+    all_series: bool = False,
     progress: Optional[ProgressFn] = None,
 ) -> List[CaseOutcome]:
     report: ProgressFn = progress or (lambda f, m: None)
@@ -936,9 +967,14 @@ def run_inference_batch(
     try:
         kind, files = detect_input(paths, tmp_dir / "expand")
         if kind == "dicom":
-            cases = [("DICOM series", files, series_uid)]
+            if all_series:
+                series = list_dicom_series(files, tmp_dir / "scan")
+                cases = [(s.description or f"series {s.series_number}", files, s.uid) for s in series]
+            else:
+                cases = [("DICOM series", files, series_uid)]
         else:
             cases = [(f.name, [f], None) for f in files]
+
         n = len(cases)
         for i, (name, case_files, uid) in enumerate(cases):
             def case_progress(frac: float, msg: str, i: int = i) -> None:
@@ -963,7 +999,6 @@ def run_inference_batch(
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
-
 
 def export_segmentation(res: InferenceResult, path: Union[str, Path]) -> Path:
     """Write the tumour mask as NIfTI (``.nii`` / ``.nii.gz``) on the ORIGINAL input grid of ``res``."""

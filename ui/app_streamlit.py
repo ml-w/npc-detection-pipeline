@@ -28,7 +28,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "discrimination_module" / "ui" / "results_viewer"))
 
 from inference_api import (CaseOutcome, InputError, ModelUnavailableError, axial_view,  # noqa: E402
-                           clear_all_caches, cleanup_temp_dirs, export_segmentation,
+                           clear_all_caches, cleanup_temp_dirs, detect_input_summary, export_segmentation,
                            list_dicom_series, reduce_attention, run_inference_batch)
 from visualization import apply_jet_colormap, draw_contour                                    # noqa: E402  (viewer)
 
@@ -266,12 +266,11 @@ def _footer() -> None:
 
 def _save_uploads(files) -> Tuple[List[str], Path]:
     tmp = Path(tempfile.mkdtemp(prefix="npc_up_"))
-    out = []
     try:
         for i, f in enumerate(files):
             d = tmp / str(i)                           # own folder per upload: equal file names do not overwrite
             d.mkdir()
-            p = d / (f.name if f.name else f"file{i}")
+            p = d / (Path(f.name).name if f.name else f"file{i}")
             p.write_bytes(f.getbuffer())
             out.append(str(p))
         return out, tmp
@@ -292,20 +291,37 @@ def _scan_uploads(files) -> dict:
     cached = st.session_state.get("scan")
     if cached and cached["key"] == key:
         return cached
-    paths, up_dir = _save_uploads(files)
-    scan = {"key": key, "paths": paths, "up_dir": up_dir, "series": [], "error": None}
-    if not all(Path(p).name.lower().endswith((".nii", ".nii.gz")) for p in scan["paths"]):
-        try:
-            scan_dir = Path(tempfile.mkdtemp(prefix="npc_scan_"))
-            scan["scan_dir"] = scan_dir
-            scan["series"] = list_dicom_series(scan["paths"], scan_dir)
-        except InputError as exc:
-            scan["error"] = str(exc)
-        except Exception as exc:                                # surface unexpected failures, keep the app alive
-            scan["error"] = f"{type(exc).__name__}: {exc}"
+    st.session_state.pop("outcomes", None)                      # new file set: drop results of the previous one
+    with st.spinner("Scanning uploads..."):
+        paths, up_dir = _save_uploads(files)
+        scan = {"key": key, "paths": paths, "up_dir": up_dir, "series": [], "error": None, "summary": None}
+        if not all(Path(p).name.lower().endswith((".nii", ".nii.gz")) for p in scan["paths"]):
+            try:
+                scan_dir = Path(tempfile.mkdtemp(prefix="npc_scan_"))
+                scan["scan_dir"] = scan_dir
+                scan["series"] = list_dicom_series(scan["paths"], scan_dir)
+            except InputError as exc:
+                scan["error"] = str(exc)
+            except Exception as exc:                            # surface unexpected failures, keep the app alive
+                scan["error"] = f"{type(exc).__name__}: {exc}"
+        scan["summary"] = detect_input_summary([Path(p) for p in scan["paths"]], series=scan["series"])
     st.session_state["scan"] = scan
     st.session_state["cleanup"].dirs.extend([up_dir] + ([scan["scan_dir"]] if "scan_dir" in scan else []))
     return scan
+
+
+def _summary_text(s: dict) -> str:
+    """One-line description of what was detected in the uploads, e.g. ``Detected: 120 DICOM files in 2 series``."""
+    parts = []
+    for field, singular, plural in (("nifti", "NIfTI file", "NIfTI files"), ("dicom", "DICOM file", "DICOM files"),
+                                    ("zip", "zip archive", "zip archives"), ("other", "unrecognised file",
+                                                                             "unrecognised files")):
+        if s[field]:
+            parts.append(f"{s[field]} {singular if s[field] == 1 else plural}")
+    text = "Detected: " + ", ".join(parts)
+    if s["series"]:
+        text += f" in {s['series']} series" if s["dicom"] else f" containing {s['series']} DICOM series"
+    return text
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -374,11 +390,9 @@ with st.sidebar:
         st.session_state.pop("error", None)
         st.success(f"All caches cleared and {n_removed} temp dirs removed.")
         st.rerun()
-    st.divider()
     st.button("Light mode" if st.session_state["dark"] else "Dark mode",
               icon=":material/light_mode:" if st.session_state["dark"] else ":material/dark_mode:",
               on_click=_flip_theme, key="theme_btn", use_container_width=True)
-
 hero_l, hero_r = st.columns([5, 7], gap="large", vertical_alignment="center")
 with hero_l:
     if _banner_uri():
@@ -393,26 +407,29 @@ with hero_r:
 
 st.markdown('<div class="npc-section">Case</div>', unsafe_allow_html=True)
 with st.container(border=True):
-    uploads = st.file_uploader("NIfTI (.nii/.nii.gz) or DICOM series (multiple files or .zip)",
-                               accept_multiple_files=True)
+    up_mode = st.radio("Upload mode", ["Files", "Folder"], horizontal=True, label_visibility="collapsed")
+    uploads = st.file_uploader("NIfTI (.nii/.nii.gz) or DICOM series",
+                               accept_multiple_files="directory" if up_mode == "Folder" else True)
     st.markdown('<p class="npc-hint">Several NIfTI files are scored as separate cases (one result each).</p>',
                 unsafe_allow_html=True)
-    scan = _scan_uploads(uploads) if uploads else {"series": [], "error": None}
+    scan = _scan_uploads(uploads) if uploads else {"series": [], "error": None, "summary": None}
     if scan["error"]:
         st.error(scan["error"])
+    elif scan["summary"] and any(scan["summary"][k] for k in ("nifti", "dicom", "zip", "other")):
+        st.info(_summary_text(scan["summary"]))
+
+    all_series = False
+    if scan["summary"] and scan["summary"]["series"] > 1:
+        all_series = st.checkbox("Score all series", value=False, help="Each series will be scored as a separate case.")
+
     series = scan["series"]
     series_uid = None
-    if len(series) > 1:
+    if not all_series and len(series) > 1:
         labels = {s.uid: _series_label(s) for s in series}
         default = next((i for i, s in enumerate(series) if s.is_t2w_fs), 0)
         series_uid = st.selectbox("DICOM series (choose the T2w-fs series)", options=list(labels), index=default,
                                   format_func=labels.get, key=f"series_uid_{abs(hash(scan['key']))}")
-    st.markdown('<p class="npc-hint">DICOM is always converted and normalised. A NIfTI straight from the scanner '
-                'needs normalisation: leave it ticked unless the file is already Nyul-normalised.</p>',
-                unsafe_allow_html=True)
-    opt_l, opt_r = st.columns([3, 1], vertical_alignment="bottom")
-    with opt_l:
-        with st.expander("Advanced"):
+                        'Nyul-normalised.</p>', unsafe_allow_html=True)
             normalize = st.checkbox("Run intensity normalisation (NIfTI only)", value=True,
                                     help="Unticked = the NIfTI is treated as already normalised. DICOM is always "
                                          "converted and normalised.")
@@ -421,21 +438,40 @@ with st.container(border=True):
                                         "instead of a tumour-centred crop; no segmentation download / outline.")
             dual_crop = st.checkbox("Run dual-crop inference", value=False,
                                     help="Half-patch dual-view encoding for higher effective-resolution self-attention maps.")
+            st.divider()
+            server_path = st.text_input("Server-side folder path", help="Absolute path to a folder on the server. "
+                                                                        "Requires NPC_UPLOAD_ROOT to be set.")
+            if server_path:
+                allowed_root = os.environ.get("NPC_UPLOAD_ROOT")
+                if not allowed_root:
+                    st.error("Server-side path is disabled (NPC_UPLOAD_ROOT not set).")
+                    server_path = None
+                else:
+                    p = Path(server_path).resolve()
+                    if not str(p).startswith(str(Path(allowed_root).resolve())):
+                        st.error(f"Path must be within {allowed_root}")
+                        server_path = None
+            if server_path:
+                uploads = [Path(server_path)]
+                # Note: For server path, we'll need to handle it in the Run block
     with opt_r:
         run = st.button("Run inference", type="primary", use_container_width=True, disabled=not uploads)
 
 if run and uploads:
     bar = st.progress(0.0, text="Starting")
-    scan_data = _scan_uploads(uploads)
-    paths = scan_data["paths"]
+    if isinstance(uploads[0], Path):
+        paths = uploads
+    else:
+        scan_data = _scan_uploads(uploads)
+        paths = scan_data["paths"]
     try:
         outcomes = run_inference_batch(paths, normalize=normalize, localize=localize,
                                        rai_dual_crop_inference=dual_crop,
+                                       all_series=all_series,
                                        with_attention=True,
                                        series_uid=series_uid,
                                        progress=lambda frac, msg: bar.progress(min(frac, 1.0), text=msg))
         st.session_state["outcomes"] = outcomes
-        st.session_state["run_id"] = uuid.uuid4().hex
         st.session_state.pop("error", None)
     except (InputError, ModelUnavailableError) as exc:
         st.session_state.pop("outcomes", None)
