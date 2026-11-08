@@ -1,6 +1,6 @@
 # UI-only dependencies (kept separate from the repo's requirements.txt; install into a dedicated venv).
-gradio>=5,<6
-streamlit>=1.50
+gradio>=4.44,<6          # file_count="directory" exists since 4.x; gradio 5 needs Python>=3.10
+streamlit>=1.49.0
 numpy
 torch>=2.0
 torchio>=0.19,<0.20      # pytorch_med_imaging imports torchio.typing, removed in >=0.21

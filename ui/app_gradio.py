@@ -3,11 +3,19 @@
     python app_gradio.py                   # real model (needs weights, see README_UI.md)
 """
 import argparse
-import sys
+import tempfile
 from pathlib import Path
 
 import gradio as gr
-from inference_api import InputError, ModelUnavailableError, run_inference_batch
+from inference_api import (InputError, ModelUnavailableError, detect_input, list_dicom_series,
+                           run_inference_batch)
+
+
+def _n_dicom_series(paths) -> int:
+    """Number of DICOM series in the upload (0 for NIfTI input)."""
+    with tempfile.TemporaryDirectory(prefix="npc_scan_") as scratch:
+        kind, files = detect_input(paths, Path(scratch) / "expand")
+        return len(list_dicom_series(files, Path(scratch) / "series")) if kind == "dicom" else 0
 
 
 def predict(files, normalize, progress=gr.Progress()):
@@ -15,7 +23,9 @@ def predict(files, normalize, progress=gr.Progress()):
         raise gr.Error("Please upload a NIfTI file or a DICOM series (files, folder or .zip).")
     paths = [f if isinstance(f, str) else f.name for f in files]
     try:
-        outcomes = run_inference_batch(paths, normalize=normalize, all_series=True,
+        # Several series: score every T2w-fs one as its own case. A single series is scored whatever its
+        # description says (same as the Streamlit app).
+        outcomes = run_inference_batch(paths, normalize=normalize, all_series=_n_dicom_series(paths) > 1,
                                        progress=lambda frac, msg: progress(frac, desc=msg))
     except (InputError, ModelUnavailableError) as exc:
         raise gr.Error(str(exc))

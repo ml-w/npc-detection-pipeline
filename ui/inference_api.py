@@ -179,7 +179,7 @@ def get_series_hash(files: List[Path]) -> str:
 # --------------------------------------------------------------------------------------------------
 # Temp directory cleanup
 # --------------------------------------------------------------------------------------------------
-TEMP_DIR_PREFIXES = ("npc_up_", "npc_scan_", "npc_seg_", "npc_ui_")
+TEMP_DIR_PREFIXES = ("npc_up_", "npc_scan_", "npc_seg_", "npc_ui_", "npc_batch_")
 
 def clear_all_caches() -> None:
     """Clear all in-process memory caches and the persistent disk cache."""
@@ -990,7 +990,10 @@ def run_inference_batch(
             else:
                 cases = [("DICOM series", files, series_uid, False)]
         else:
-            cases = [(f.name, [f], None, False) for f in files]
+            names = [f.name for f in files]
+            # equal base names (e.g. the same file name in several folders): prefix the parent folder name
+            cases = [(f"{f.parent.name}/{f.name}" if names.count(f.name) > 1 else f.name, [f], None, False)
+                     for f in files]
 
         n = len(cases)
         for i, (name, case_files, uid, non_t2w) in enumerate(cases):
@@ -1018,9 +1021,8 @@ def run_inference_batch(
         outcomes.extend(skipped)
         report(1.0, "Done")
         return outcomes
-    except Exception:
+    finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
 
 def export_segmentation(res: InferenceResult, path: Union[str, Path]) -> Path:
     """Write the tumour mask as NIfTI (``.nii`` / ``.nii.gz``) on the ORIGINAL input grid of ``res``."""

@@ -270,9 +270,14 @@ def _save_uploads(files) -> Tuple[List[str], Path]:
     out: List[str] = []
     try:
         for i, f in enumerate(files):
-            d = tmp / str(i)                           # own folder per upload: equal file names do not overwrite
-            d.mkdir()
-            p = d / (Path(f.name).name if f.name else f"file{i}")
+            # Folder uploads carry their relative path in the name ("case1/T2.nii.gz"): keep it, so the parent folder
+            # name tells equal file names apart. Plain file uploads get their own folder per upload instead.
+            parts = [x for x in (f.name or "").replace("\\", "/").split("/") if x not in ("", ".", "..")]
+            if len(parts) > 1:
+                p = tmp.joinpath("folder", *parts)
+            else:
+                p = tmp / str(i) / (parts[0] if parts else f"file{i}")
+            p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(f.getbuffer())
             out.append(str(p))
         return out, tmp
@@ -287,17 +292,20 @@ def _series_label(s) -> str:
 
 
 def _analyse_paths(paths: List[str]) -> dict:
-    """List DICOM series (empty for all-NIfTI input) and count the files by kind."""
+    """Classify the input with ``detect_input`` (the same call the run uses), list its DICOM series and count the
+    files by kind.  ``error`` is set whenever a run would be rejected (empty, mixed, unsupported ...); DICOM
+    errors can only occur for input classified as DICOM, so stray files next to NIfTI files are not an error."""
     res = {"series": [], "error": None, "summary": None}
-    if not all(Path(p).name.lower().endswith((".nii", ".nii.gz")) for p in paths):
-        try:
-            scan_dir = Path(tempfile.mkdtemp(prefix="npc_scan_"))
-            res["scan_dir"] = scan_dir
-            res["series"] = list_dicom_series(paths, scan_dir)
-        except InputError as exc:
-            res["error"] = str(exc)
-        except Exception as exc:                                # surface unexpected failures, keep the app alive
-            res["error"] = f"{type(exc).__name__}: {exc}"
+    scan_dir = Path(tempfile.mkdtemp(prefix="npc_scan_"))
+    res["scan_dir"] = scan_dir
+    try:
+        kind, files = detect_input(paths, scan_dir / "expand")
+        if kind == "dicom":
+            res["series"] = list_dicom_series(files, scan_dir / "series")
+    except InputError as exc:
+        res["error"] = str(exc)
+    except Exception as exc:                                    # surface unexpected failures, keep the app alive
+        res["error"] = f"{type(exc).__name__}: {exc}"
     res["summary"] = detect_input_summary([Path(p) for p in paths], series=res["series"])
     return res
 
@@ -512,7 +520,8 @@ with st.container(border=True):
             dual_crop = st.checkbox("Run dual-crop inference", value=False,
                                     help="Half-patch dual-view encoding for higher effective-resolution self-attention maps.")
     with opt_r:
-        run = st.button("Run inference", type="primary", use_container_width=True, disabled=not scan["paths"])
+        run = st.button("Run inference", type="primary", use_container_width=True,
+                        disabled=not scan["paths"] or bool(scan["error"]))
 
 if run and scan["paths"]:
     bar = st.progress(0.0, text="Starting")
