@@ -27,12 +27,21 @@ from packaging.version import Version
 from PIL import Image
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "discrimination_module" / "ui" / "results_viewer"))
-
 from inference_api import (CaseOutcome, InputError, ModelUnavailableError, axial_view,  # noqa: E402
                            clear_all_caches, cleanup_temp_dirs, detect_input, detect_input_summary,
                            export_segmentation, list_dicom_series, reduce_attention, run_inference_batch)
 from visualization import apply_jet_colormap, draw_contour                                    # noqa: E402  (viewer)
+from utils.report_gen import generate_report
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _report_pdf(rid: str, case_id: str, _res) -> bytes:
+    """Generate the PDF report for one case and return its bytes. ``_res`` is excluded from the cache hash."""
+    with tempfile.TemporaryDirectory(prefix="npc_report_") as tmp:
+        out = Path(tmp) / "report.pdf"
+        generate_report(_res, out)
+        return out.read_bytes()
 
 # accept_multiple_files="directory" (folder upload) exists since Streamlit 1.49.0; older versions raise a TypeError.
 _FOLDER_UPLOAD_OK = Version(st.__version__) >= Version("1.49.0")
@@ -467,80 +476,91 @@ with hero_r:
                 unsafe_allow_html=True)
 
 st.markdown('<div class="npc-section">Case</div>', unsafe_allow_html=True)
-with st.container(border=True):
-    up_mode = st.radio("Input source", ["Files", "Folder", "Server path"], horizontal=True,
-                       label_visibility="collapsed")
-    scan = {"key": None, "paths": [], "series": [], "error": None, "summary": None}
-    if up_mode == "Server path":
-        server_path = st.text_input("Server-side folder path", placeholder="/data/cases/patient_001",
-                                    help="Absolute path to a folder (or file) on the server, inside the directory "
-                                         "named by the NPC_UPLOAD_ROOT environment variable.")
-        if server_path.strip():
-            server_files, server_err = _resolve_server_path(server_path.strip())
-            if server_err:
-                scan["error"] = server_err
-            else:
-                scan = _scan_server_files(server_files)
-    else:
-        folder_mode = up_mode == "Folder"
-        if folder_mode and not _FOLDER_UPLOAD_OK:
-            st.warning(f"Your Streamlit version ({st.__version__}) does not support folder uploads. Please select "
-                       "all files manually or upgrade Streamlit (>= 1.49.0).")
-        uploads = st.file_uploader("NIfTI (.nii/.nii.gz) or DICOM series",
-                                   accept_multiple_files="directory" if folder_mode and _FOLDER_UPLOAD_OK else True)
-        if uploads:
-            scan = _scan_uploads(uploads)
-    st.markdown('<p class="npc-hint">Several NIfTI files are scored as separate cases (one result each).</p>',
-                unsafe_allow_html=True)
-    if scan["error"]:
-        st.error(scan["error"])
-    elif scan["summary"] and any(scan["summary"][k] for k in ("nifti", "dicom", "zip", "other")):
-        st.info(_summary_text(scan["summary"]))
+# While a (blocking) inference is running we do NOT redraw the input widgets. Re-rendering the
+# Advanced expander and Run button during the blocking pass is what left stale, greyed copies of
+# them stacked above the live ones. Instead the click stashes the run parameters, flips a flag and
+# reruns; the running pass renders only a progress bar, so the control tree exists exactly once.
+if not st.session_state.get("running"):
+    with st.container(border=True):
+        up_mode = st.radio("Input source", ["Files", "Folder", "Server path"], horizontal=True,
+                           label_visibility="collapsed")
+        scan = {"key": None, "paths": [], "series": [], "error": None, "summary": None}
+        if up_mode == "Server path":
+            server_path = st.text_input("Server-side folder path", placeholder="/data/cases/patient_001",
+                                        help="Absolute path to a folder (or file) on the server, inside the directory "
+                                             "named by the NPC_UPLOAD_ROOT environment variable.")
+            if server_path.strip():
+                server_files, server_err = _resolve_server_path(server_path.strip())
+                if server_err:
+                    scan["error"] = server_err
+                else:
+                    scan = _scan_server_files(server_files)
+        else:
+            folder_mode = up_mode == "Folder"
+            if folder_mode and not _FOLDER_UPLOAD_OK:
+                st.warning(f"Your Streamlit version ({st.__version__}) does not support folder uploads. Please select "
+                           "all files manually or upgrade Streamlit (>= 1.49.0).")
+            uploads = st.file_uploader("NIfTI (.nii/.nii.gz) or DICOM series",
+                                       accept_multiple_files="directory" if folder_mode and _FOLDER_UPLOAD_OK else True)
+            if uploads:
+                scan = _scan_uploads(uploads)
+        st.markdown('<p class="npc-hint">Several NIfTI files are scored as separate cases (one result each).</p>',
+                    unsafe_allow_html=True)
+        if scan["error"]:
+            st.error(scan["error"])
+        elif scan["summary"] and any(scan["summary"][k] for k in ("nifti", "dicom", "zip", "other")):
+            st.info(_summary_text(scan["summary"]))
 
-    series = scan["series"]
-    all_series = include_non_t2w = False
-    if len(series) > 1:
-        all_series = st.checkbox("Score all T2w-fs series", value=False,
-                                 help="Each T2w-fs series is scored as a separate case. Other sequences are skipped "
-                                      "unless you also tick the option below.")
-        if all_series and not all(s.is_t2w_fs for s in series):
-            include_non_t2w = st.checkbox("Also score series not identified as T2w-fs", value=False,
-                                          help="The model is trained on T2w-fs images; scores for other sequences "
-                                               "are not meaningful and are flagged with a warning.")
-    series_uid = None
-    if not all_series and len(series) > 1:
-        labels = {s.uid: _series_label(s) for s in series}
-        default = next((i for i, s in enumerate(series) if s.is_t2w_fs), 0)
-        series_uid = st.selectbox("DICOM series (choose the T2w-fs series)", options=list(labels), index=default,
-                                  format_func=labels.get, key=f"series_uid_{abs(hash(scan['key']))}")
-    opt_l, opt_r = st.columns([3, 1], vertical_alignment="bottom")
-    with opt_l:
-        with st.expander("Advanced"):
-            st.markdown('<p class="npc-hint">DICOM is always converted and normalised. A NIfTI straight from the '
-                        'scanner needs normalisation: leave it ticked unless the file is already '
-                        'Nyul-normalised.</p>', unsafe_allow_html=True)
-            normalize = st.checkbox("Run intensity normalisation (NIfTI only)", value=True,
-                                    help="Unticked = the NIfTI is treated as already normalised. DICOM is always "
-                                         "converted and normalised.")
-            localize = st.checkbox("Run tumour segmentation (localisation)", value=True,
-                                   help="Independent of intensity normalisation. Unticked = centre-crop the volume "
-                                        "instead of a tumour-centred crop; no segmentation download / outline.")
-            dual_crop = st.checkbox("Run dual-crop inference", value=False,
-                                    help="Half-patch dual-view encoding for higher effective-resolution self-attention maps.")
-    with opt_r:
-        run = st.button("Run inference", type="primary", use_container_width=True,
-                        disabled=not scan["paths"] or bool(scan["error"]))
-
-if run and scan["paths"]:
+        series = scan["series"]
+        all_series = include_non_t2w = False
+        if len(series) > 1:
+            all_series = st.checkbox("Score all T2w-fs series", value=False,
+                                     help="Each T2w-fs series is scored as a separate case. Other sequences are skipped "
+                                          "unless you also tick the option below.")
+            if all_series and not all(s.is_t2w_fs for s in series):
+                include_non_t2w = st.checkbox("Also score series not identified as T2w-fs", value=False,
+                                              help="The model is trained on T2w-fs images; scores for other sequences "
+                                                   "are not meaningful and are flagged with a warning.")
+        series_uid = None
+        if not all_series and len(series) > 1:
+            labels = {s.uid: _series_label(s) for s in series}
+            default = next((i for i, s in enumerate(series) if s.is_t2w_fs), 0)
+            series_uid = st.selectbox("DICOM series (choose the T2w-fs series)", options=list(labels), index=default,
+                                      format_func=labels.get, key=f"series_uid_{abs(hash(scan['key']))}")
+        opt_l, opt_r = st.columns([3, 1], vertical_alignment="bottom")
+        with opt_l:
+            with st.expander("Advanced"):
+                st.markdown('<p class="npc-hint">DICOM is always converted and normalised. A NIfTI straight from the '
+                            'scanner needs normalisation: leave it ticked unless the file is already '
+                            'Nyul-normalised.</p>', unsafe_allow_html=True)
+                normalize = st.checkbox("Run intensity normalisation (NIfTI only)", value=True,
+                                        help="Unticked = the NIfTI is treated as already normalised. DICOM is always "
+                                             "converted and normalised.")
+                localize = st.checkbox("Run tumour segmentation (localisation)", value=True,
+                                       help="Independent of intensity normalisation. Unticked = centre-crop the volume "
+                                            "instead of a tumour-centred crop; no segmentation download / outline.")
+                dual_crop = st.checkbox("Run dual-crop inference", value=False,
+                                        help="Half-patch dual-view encoding for higher effective-resolution self-attention maps.")
+        with opt_r:
+            run = st.button("Run inference", type="primary", use_container_width=True, key="run_btn",
+                            disabled=not scan["paths"] or bool(scan["error"]))
+    if run and scan["paths"]:
+        st.session_state["run_params"] = {
+            "paths": scan["paths"], "normalize": normalize, "localize": localize, "dual_crop": dual_crop,
+            "all_series": all_series, "include_non_t2w": include_non_t2w, "series_uid": series_uid,
+        }
+        st.session_state["running"] = True
+        st.rerun()
+else:
+    params = st.session_state.get("run_params", {})
     bar = st.progress(0.0, text="Starting")
-    paths = scan["paths"]
     try:
-        outcomes = run_inference_batch(paths, normalize=normalize, localize=localize,
-                                       rai_dual_crop_inference=dual_crop,
-                                       all_series=all_series,
-                                       include_non_t2w_fs=include_non_t2w,
+        outcomes = run_inference_batch(params["paths"], normalize=params["normalize"], localize=params["localize"],
+                                       rai_dual_crop_inference=params["dual_crop"],
+                                       all_series=params["all_series"],
+                                       include_non_t2w_fs=params["include_non_t2w"],
                                        with_attention=True,
-                                       series_uid=series_uid,
+                                       series_uid=params["series_uid"],
                                        progress=lambda frac, msg: bar.progress(min(frac, 1.0), text=msg))
         st.session_state["outcomes"] = outcomes
         st.session_state["run_id"] = uuid.uuid4().hex
@@ -551,7 +571,11 @@ if run and scan["paths"]:
     except Exception as exc:                                    # surface unexpected failures, keep the app alive
         st.session_state.pop("outcomes", None)
         st.session_state["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        st.session_state.pop("running", None)
+        st.session_state.pop("run_params", None)
     bar.empty()
+    st.rerun()
 
 
 if st.session_state.get("error"):
@@ -596,16 +620,25 @@ st.markdown(_result_card(res), unsafe_allow_html=True)
 st.markdown('<div class="npc-dl-gap"></div>', unsafe_allow_html=True)
 show_case_dl = res.segmentation_image is not None
 show_zip = len(outcomes) > 1 and any(o.result is not None and o.result.segmentation_image is not None for o in outcomes)
-if show_case_dl or show_zip:
-    dl_case, dl_zip, _ = st.columns([2, 2, 3], gap="small")
-    if show_case_dl:
-        dl_case.download_button("Download this case (NIfTI)", data=_seg_nifti(rid, res),
-                                file_name=f"{res.case_id}_segmentation.nii.gz", mime="application/gzip",
-                                use_container_width=True)
-    if show_zip:
-        dl_zip.download_button("Download all cases (ZIP)", data=_segs_zip(run_id, outcomes),
-                               file_name=f"segmentations_{run_id[:8]}.zip", mime="application/zip",
-                               use_container_width=True)
+dl_case, dl_report, dl_zip, _ = st.columns([2, 2, 2, 1], gap="small")
+if show_case_dl:
+    dl_case.download_button("Download this case (NIfTI)", data=_seg_nifti(rid, res),
+                            file_name=f"{res.case_id}_segmentation.nii.gz", mime="application/gzip",
+                            use_container_width=True)
+report_key = f"{rid}:{res.case_id}"
+if st.session_state.get("report_ready") == report_key:
+    with st.spinner("Generating report..."):
+        report_bytes = _report_pdf(rid, res.case_id, res)
+    dl_report.download_button("Download Report (PDF)", data=report_bytes,
+                             file_name=f"{res.case_id}_report.pdf", mime="application/pdf",
+                             use_container_width=True)
+elif dl_report.button("Generate report (PDF)", use_container_width=True):
+    st.session_state["report_ready"] = report_key
+    st.rerun()
+if show_zip:
+    dl_zip.download_button("Download all cases (ZIP)", data=_segs_zip(run_id, outcomes),
+                           file_name=f"segmentations_{run_id[:8]}.zip", mime="application/zip",
+                           use_container_width=True)
 with st.expander("Raw network outputs"):
     st.write(dict(zip(["fused logit", "rnn confidence", "rnn-only logit"], [round(v, 3) for v in res.raw_outputs])))
 

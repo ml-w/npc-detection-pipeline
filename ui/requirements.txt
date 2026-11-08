@@ -10,3 +10,4 @@ einops
 matplotlib               # imported by the results_viewer helpers
 rich<15
 pandas<3
+reportlab

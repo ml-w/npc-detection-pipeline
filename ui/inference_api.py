@@ -98,6 +98,8 @@ class InferenceResult:
     attention: Optional[np.ndarray] = None   # (layers, H, W, S) int16, 0..1000 (same scaling as results viewer)
     segmentation: Optional[np.ndarray] = None  # (H, W, S) uint8 tumour mask in the same grid as ``volume``; None = not run
     segmentation_image: Optional[sitk.Image] = None  # same mask on the ORIGINAL input grid; see export_segmentation
+    dicom_tags: Optional[Dict[str, str]] = None  # Patient metadata from DICOM headers
+    normalized_image: Optional[sitk.Image] = None  # The normalized T2w-fs image
 
 
 
@@ -379,7 +381,7 @@ def _read_dicom_series(files: Sequence[Path]) -> "sitk.Image":
 
 
 def _dicom_tags(path: Path) -> Dict[str, str]:
-    """SeriesDescription, ProtocolName, Modality and SeriesNumber of one file (header only)."""
+    """Extract patient and study metadata from a DICOM file header."""
     import SimpleITK as sitk
     reader = sitk.ImageFileReader()
     reader.SetFileName(str(path))
@@ -389,8 +391,18 @@ def _dicom_tags(path: Path) -> Dict[str, str]:
     def get(key: str) -> str:
         return reader.GetMetaData(key).strip() if reader.HasMetaDataKey(key) else ""
 
-    return {"description": get("0008|103e"), "protocol": get("0018|1030"),
-            "modality": get("0008|0060"), "series_number": get("0020|0011")}
+    return {
+        "description": get("0008|103e"),
+        "protocol": get("0018|1030"),
+        "modality": get("0008|0060"),
+        "series_number": get("0020|0011"),
+        "PatientName": get("0010|0010"),
+        "PatientID": get("0010|0020"),
+        "PatientSex": get("0010|0040"),
+        "PatientAge": get("0010|1010"),
+        "StudyDate": get("0008|0020"),
+        "StationName": get("0008|1010"),
+    }
 
 
 def list_dicom_series(paths: Sequence[Union[str, Path]], scratch: Path) -> List[DicomSeries]:
@@ -833,6 +845,7 @@ def _score_case(kind: str, files: List[Path], *, normalize: bool, localize: bool
             files = _select_series(series, series_uid).files
             reference = _read_dicom_series(files)
         input_hash = get_series_hash(files) if kind == "dicom" else get_file_hash(files[0])
+        tags = _dicom_tags(files[0]) if kind == "dicom" else {"PatientID": name, "PatientName": "Anonymized"}
 
         dev = pick_device(device)
         net_check = Path(checkpoint or DEFAULT_CHECKPOINT)
@@ -849,6 +862,7 @@ def _score_case(kind: str, files: List[Path], *, normalize: bool, localize: bool
         cached = _get_inference_cache(cache_key)             # before preprocessing and before _INFER_LOCK
         if cached is not None:
             cached.case_id = name                            # same content may be uploaded under another file name
+            cached.dicom_tags = tags
             cached.elapsed_s = time.time() - t0              # this call's latency; warnings stay those of the original run
             progress(1.0, "Using cached result")
             return cached
@@ -890,6 +904,8 @@ def _score_case(kind: str, files: List[Path], *, normalize: bool, localize: bool
             device=str(dev), input_kind=kind, normalized=ran_norm, raw_outputs=raw,
             elapsed_s=time.time() - t0, input_hash=input_hash,
             warnings=warnings, volume=volume, attention=attention,
+            dicom_tags=tags,
+            normalized_image=sitk.ReadImage(str(nii)),
             segmentation=segmentation, segmentation_image=segmentation_image,
             dual_crop=bool(getattr(net, '_dual_view_inference_enabled', lambda: False)()),
         )
