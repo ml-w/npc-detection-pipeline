@@ -29,3 +29,4 @@ docs/
 # Agents
 .claude
 CLAUDE.md
+.omp/
