@@ -14,8 +14,11 @@ treated as already normalised; ticked by default in both apps).
 ## Input sources
 
 * **Files** - pick one or more files (or a `.zip`).
-* **Folder** - upload a whole folder (Streamlit: `st.file_uploader(accept_multiple_files="directory")`, needs
-  Streamlit >= 1.49; Gradio: `gr.File(file_count="directory")`). Sub-folders are walked recursively.
+* **Folder** - upload a whole folder (Streamlit: `st.file_uploader(accept_multiple_files="directory")`;
+  Gradio: `gr.File(file_count="directory")`). Sub-folders are walked recursively. Folder upload in Streamlit
+  requires **Streamlit >= 1.49.0**; older versions (e.g. 1.48.x) cannot do it, so the app shows a warning and falls
+  back to the multi-file selector in "Folder" mode: select all the files of the case manually, and they are treated as
+  the folder content.
 * **Server path** (Streamlit only) - read a folder or file that already lives on the server, without uploading it.
   Disabled unless the environment variable **`NPC_UPLOAD_ROOT`** is set; the path (and every file found in it, after
   symlinks are resolved) must lie inside that directory, otherwise it is rejected.

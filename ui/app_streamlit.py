@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import streamlit as st
+from packaging.version import Version
 from PIL import Image
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -32,6 +33,9 @@ from inference_api import (CaseOutcome, InputError, ModelUnavailableError, axial
                            clear_all_caches, cleanup_temp_dirs, detect_input_summary, export_segmentation,
                            list_dicom_series, reduce_attention, run_inference_batch)
 from visualization import apply_jet_colormap, draw_contour                                    # noqa: E402  (viewer)
+
+# accept_multiple_files="directory" (folder upload) exists since Streamlit 1.49.0; older versions raise a TypeError.
+_FOLDER_UPLOAD_OK = Version(st.__version__) >= Version("1.49.0")
 
 st.set_page_config(page_title="NPC Detection Pipeline", layout="wide", initial_sidebar_state="collapsed")
 
@@ -478,8 +482,12 @@ with st.container(border=True):
             else:
                 scan = _scan_server_files(server_files)
     else:
+        folder_mode = up_mode == "Folder"
+        if folder_mode and not _FOLDER_UPLOAD_OK:
+            st.warning(f"Your Streamlit version ({st.__version__}) does not support folder uploads. Please select "
+                       "all files manually or upgrade Streamlit (>= 1.49.0).")
         uploads = st.file_uploader("NIfTI (.nii/.nii.gz) or DICOM series",
-                                   accept_multiple_files="directory" if up_mode == "Folder" else True)
+                                   accept_multiple_files="directory" if folder_mode and _FOLDER_UPLOAD_OK else True)
         if uploads:
             scan = _scan_uploads(uploads)
     st.markdown('<p class="npc-hint">Several NIfTI files are scored as separate cases (one result each).</p>',
