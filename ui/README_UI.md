@@ -9,7 +9,22 @@ Two front-ends over one shared module, `inference_api.py`.
 
 Input is auto-detected: one or more NIfTI files (each file is one case), or a DICOM series (files, folder or `.zip`).
 DICOM is always converted + normalised. For NIfTI the **normalisation checkbox** decides (unticked = the file is
-treated as already normalised).
+treated as already normalised; ticked by default in both apps).
+
+## Input sources
+
+* **Files** - pick one or more files (or a `.zip`).
+* **Folder** - upload a whole folder (Streamlit: `st.file_uploader(accept_multiple_files="directory")`, needs
+  Streamlit >= 1.49; Gradio: `gr.File(file_count="directory")`). Sub-folders are walked recursively.
+* **Server path** (Streamlit only) - read a folder or file that already lives on the server, without uploading it.
+  Disabled unless the environment variable **`NPC_UPLOAD_ROOT`** is set; the path (and every file found in it, after
+  symlinks are resolved) must lie inside that directory, otherwise it is rejected.
+  `NPC_UPLOAD_ROOT=/data/cases streamlit run app_streamlit.py`
+
+DICOM files are recognised by the `DICM` marker at byte 128, whatever their name (PACS exports often use UID-based
+names with no `.dcm` suffix); `.dcm` / `.ima` files are accepted by extension. After an upload or server path is read,
+the Streamlit page shows what was detected (e.g. "Detected: 120 DICOM files in 2 series"); choosing new files clears
+the previous results.
 
 ## Setup (dedicated venv; the repo's own requirements are untouched)
 
@@ -37,6 +52,11 @@ Real mode is verified on the example cases: CLI, `inference_api`, Gradio and Str
 SeriesDescription / ProtocolName look like T2w-fs (`list_dicom_series` sets `is_t2w_fs`) is preselected and marked
 "(T2w-fs)"; if none matches, the first series is preselected. Single-series uploads need no choice and show no
 selectbox. The Python API behaves the same way: an ambiguous upload raises `InputError` unless `series_uid` is given.
+
+**Scoring all series.** Streamlit's *Score all T2w-fs series* option (and `run_inference_batch(..., all_series=True)`,
+used by the Gradio app) scores each T2w-fs series as its own case, staging only that series' files. The model is
+trained on T2w-fs images, so other sequences are skipped (reported as "Skipped" rows) unless
+`include_non_t2w_fs=True` / *Also score series not identified as T2w-fs* is set; those results carry a warning.
 
 **Segmentation download.** When a segmentation exists, the result card offers *Download segmentation (NIfTI)*
 (`<case_id>_segmentation.nii.gz`). `export_segmentation()` writes the tumour mask on the ORIGINAL input grid: the

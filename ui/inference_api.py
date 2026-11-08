@@ -225,13 +225,12 @@ def _is_nifti(p: Path) -> bool:
 
 
 def _is_dicom_file(p: Path) -> bool:
-    """True when ``p`` carries the ``DICM`` magic at offset 128.
-
-    PACS exports often use UID-based names without a ``.dcm`` suffix (or with dotted UID "suffixes"), so the
-    extension is never trusted: every file that is not already identified as NIfTI / Zip is sniffed.
-    """
+    """True for ``.dcm`` / ``.ima`` files (trusted by extension: anonymised files may lack the preamble) and for any
+    other non-NIfTI / non-Zip file carrying the ``DICM`` magic at offset 128 (PACS exports often use UID-based names)."""
     if _is_nifti(p) or p.suffix.lower() == ".zip":
         return False
+    if p.suffix.lower() in {".dcm", ".ima"}:
+        return True
     try:
         with open(p, "rb") as fh:
             fh.seek(128)
@@ -959,24 +958,42 @@ def run_inference_batch(
     models_dir: Optional[Union[str, Path]] = None,
     series_uid: Optional[str] = None,
     all_series: bool = False,
+    include_non_t2w_fs: bool = False,
     progress: Optional[ProgressFn] = None,
 ) -> List[CaseOutcome]:
+    """Score every case in ``paths``: one case per NIfTI file, or one DICOM series.
+
+    ``all_series=True`` scores every T2w-fs series of a DICOM upload as its own case (each case only sees its own
+    files).  The model is trained on T2w-fs images, so other series are NOT scored by default: they are reported as
+    skipped outcomes.  ``include_non_t2w_fs=True`` scores them too, with a warning on the result.
+    """
     report: ProgressFn = progress or (lambda f, m: None)
     outcomes: List[CaseOutcome] = []
     tmp_dir = Path(tempfile.mkdtemp(prefix="npc_batch_"))
     try:
         kind, files = detect_input(paths, tmp_dir / "expand")
+        skipped: List[CaseOutcome] = []
         if kind == "dicom":
             if all_series:
                 series = list_dicom_series(files, tmp_dir / "scan")
-                cases = [(s.description or f"series {s.series_number}", files, s.uid) for s in series]
+                cases = []
+                for s in series:
+                    name = f"{s.description or 'series'} (#{s.series_number or '?'})"
+                    if s.is_t2w_fs or include_non_t2w_fs:
+                        cases.append((name, s.files, s.uid, not s.is_t2w_fs))
+                    else:
+                        skipped.append(CaseOutcome(name=name, error="Skipped: series not identified as T2w-fs "
+                                                                    "(the model is trained on T2w-fs images)."))
+                if not cases:
+                    raise InputError("No T2w-fs series found in the upload. Select a series explicitly or allow "
+                                     "non-T2w-fs series.")
             else:
-                cases = [("DICOM series", files, series_uid)]
+                cases = [("DICOM series", files, series_uid, False)]
         else:
-            cases = [(f.name, [f], None) for f in files]
+            cases = [(f.name, [f], None, False) for f in files]
 
         n = len(cases)
-        for i, (name, case_files, uid) in enumerate(cases):
+        for i, (name, case_files, uid, non_t2w) in enumerate(cases):
             def case_progress(frac: float, msg: str, i: int = i) -> None:
                 report((i + frac) / n, f"[{i + 1}/{n}] {msg}")
 
@@ -986,6 +1003,10 @@ def run_inference_batch(
                                   with_attention=with_attention,
                                   device=device, checkpoint=checkpoint, models_dir=models_dir, case_name=None,
                                   series_uid=uid, progress=case_progress)
+                if non_t2w:
+                    res = replace(res, warnings=list(res.warnings) + [
+                        "This series was not identified as T2w-fs; the model is trained on T2w-fs images, so "
+                        "the score may be unreliable."])
                 outcomes.append(CaseOutcome(name=name, result=res, input_hash=res.input_hash))
             except ModelUnavailableError:
                 raise
@@ -994,6 +1015,7 @@ def run_inference_batch(
             except Exception as exc:
                 logger.exception("Case '%s' failed", name)
                 outcomes.append(CaseOutcome(name=name, error=f"{type(exc).__name__}: {exc}"))
+        outcomes.extend(skipped)
         report(1.0, "Done")
         return outcomes
     except Exception:

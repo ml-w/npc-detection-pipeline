@@ -12,7 +12,7 @@ from inference_api import InputError, ModelUnavailableError, run_inference_batch
 
 def predict(files, normalize, progress=gr.Progress()):
     if not files:
-        return []
+        raise gr.Error("Please upload a NIfTI file or a DICOM series (files, folder or .zip).")
     paths = [f if isinstance(f, str) else f.name for f in files]
     try:
         outcomes = run_inference_batch(paths, normalize=normalize, all_series=True,
@@ -34,9 +34,8 @@ def predict(files, normalize, progress=gr.Progress()):
 def build() -> gr.Blocks:
     with gr.Blocks(title="NPC rAIdiologist") as demo:
         gr.Markdown("# NPC rAIdiologist - malignancy score\nResearch use only; not a clinical device.")
-        with gr.Row():
-            up_mode = gr.Radio(["Files", "Folder"], value="Files", label="Upload mode")
-            files = gr.File(label="NIfTI (.nii/.nii.gz) or DICOM series", file_count="multiple")
+        up_mode = gr.Radio(["Files", "Folder"], value="Files", label="Upload mode")
+        files = gr.File(label="NIfTI (.nii/.nii.gz) or DICOM series", file_count="multiple")
 
         def update_file_count(mode):
             return gr.File(file_count="directory" if mode == "Folder" else "multiple")
