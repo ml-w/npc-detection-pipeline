@@ -492,36 +492,44 @@ class TransformerEncoderLayerWithAttn(nn.TransformerEncoderLayer):
         Returns:
             tio.ScalarImage: A TorchIO ScalarImage containing the resized prediction data.
         """
-        # Reshape the playback data for prediction and confidence
         # 0-th token is the prediction, 2-nd + tokens are image information tokens
-        # Follow the device of the input tensor (was hard-coded to ``.cuda()``). When only a shape is given,
+        # Follow the device of the input tensor (previously hard-coded to CUDA). When only a shape is given,
         # keep the legacy behavior of using CUDA if available, otherwise stay on CPU.
         if isinstance(in_tensor, torch.Tensor):
             device = in_tensor.device
         else:
             device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-        sa_for_prediction = rearrange(
-            playback[:, :, 0, 2:].to(device), 'b c (s w h) -> b c h w s', **grid_size
-        )
+        pred_tokens = playback[:, :, 0, 2:].to(device)
         # 1-st token is the confidence token
-        sa_for_confidence = rearrange(
-            playback[:, :, 1, 2:].to(device), 'b c (s w h) -> b c h w s', **grid_size
-        )
+        conf_tokens = playback[:, :, 1, 2:].to(device)
+
+        if grid_size.get('views', 1) == 2:
+            # Dual-view layout from :class:`rAIdiologist_Transformer` (per slice: view0 cells, view1 cells)
+            sa_for_prediction = TransformerEncoderLayerWithAttn._two_view_to_canvas(
+                pred_tokens, grid_size['h'], grid_size['w'], grid_size['s'])
+            sa_for_confidence = TransformerEncoderLayerWithAttn._two_view_to_canvas(
+                conf_tokens, grid_size['h'], grid_size['w'], grid_size['s'])
+        else:
+            sa_for_prediction = rearrange(
+                pred_tokens, 'b c (s w h) -> b c h w s', h=grid_size['h'], w=grid_size['w'], s=grid_size['s'])
+            sa_for_confidence = rearrange(
+                conf_tokens, 'b c (s w h) -> b c h w s', h=grid_size['h'], w=grid_size['w'], s=grid_size['s'])
 
         if isinstance(in_tensor, torch.Tensor):
             in_tensor = in_tensor.shape
         elif not isinstance(in_tensor, (tuple, torch.Size, list)):
             raise RuntimeError(f"In correct type {type(in_tensor) = }. Expect torch.Tensor or shape")
 
-        # Interpolate reshaped playback data to match input tensor size
+        # Interpolate reshaped playback data to match input tensor size (in-plane H x W, slices = grid_size['s'])
+        align = grid_size.get('views', 1) == 2
         sa_for_prediction_resized = F.interpolate(
             sa_for_prediction, size=(in_tensor[-3], in_tensor[-2], grid_size['s']),
-            mode='trilinear', align_corners=False
+            mode='trilinear', align_corners=align
         ).float()
 
         sa_for_confidence_resized = F.interpolate(
             sa_for_confidence, size=(in_tensor[-3], in_tensor[-2], grid_size['s']),
-            mode='trilinear', align_corners=False
+            mode='trilinear', align_corners=align
         ).float()
 
         # Create TorchIO images for input, prediction, and confidence. Normalize them to range 0-1000
@@ -532,3 +540,31 @@ class TransformerEncoderLayerWithAttn(nn.TransformerEncoderLayer):
             tensor=(sa_for_confidence_resized / sa_for_confidence_resized.max() * 1000).type(torch.int16).squeeze().cpu()
         )
         return resized_sa_pred, resized_sa_conf
+
+    @staticmethod
+    def _two_view_to_canvas(tokens: torch.Tensor, h: int, w: int, s: int) -> torch.Tensor:
+        r"""Place dual-view SA tokens on a finer ``(2h+1) x (2w+1)`` canvas.
+
+        Tokens are ``(B x C x (s v w h))`` with ``v`` = 2 views. View 0 cell ``(i, j)`` goes to canvas ``(2i+1, 2j+1)``
+        and view 1 cell ``(i, j)`` goes to ``(2i+2, 2j+2)``. The largest index is ``2h`` (``2w``) for any grid size, so
+        nothing overflows (the previous 16x16 idea overflowed at h=7). Canvas cells that neither view hits are filled
+        with the mean of populated cells in their 3x3 neighbourhood (same approach for all slices). Returns
+        ``(B x C x (2h+1) x (2w+1) x s)``.
+        """
+        v = rearrange(tokens, 'b c (s v w h) -> b c v h w s', v=2, h=h, w=w, s=s)
+        B, C = v.shape[0], v.shape[1]
+        Hc, Wc = 2 * h + 1, 2 * w + 1
+        canvas = v.new_zeros(B, C, Hc, Wc, s)
+        canvas[:, :, 1::2, 1::2] = v[:, :, 0]
+        canvas[:, :, 0:-1:2, 0:-1:2] = v[:, :, 1]
+
+        mask = torch.zeros(1, 1, Hc, Wc, dtype=v.dtype, device=v.device)
+        mask[..., 1::2, 1::2] = 1
+        mask[..., 0:-1:2, 0:-1:2] = 1
+
+        # Treat slices as batch for 2D neighbourhood filling
+        flat = canvas.permute(0, 1, 4, 2, 3).reshape(-1, 1, Hc, Wc)
+        num = F.avg_pool2d(flat * mask, kernel_size=3, stride=1, padding=1, count_include_pad=True)
+        den = F.avg_pool2d(mask, kernel_size=3, stride=1, padding=1, count_include_pad=True)
+        filled = torch.where(mask.bool(), flat, num / den.clamp_min(1e-12))
+        return filled.reshape(B, C, s, Hc, Wc).permute(0, 1, 3, 4, 2)

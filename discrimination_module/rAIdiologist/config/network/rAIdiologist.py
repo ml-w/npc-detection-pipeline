@@ -315,7 +315,8 @@ class rAIdiologist(nn.Module):
 
 class rAIdiologist_Transformer(rAIdiologist):
     def __init__(self, in_ch=1, out_ch=2, record=False, cnn_dropout=0.15, rnn_dropout=0.1, bidirectional=False, mode=0,
-                 reduce_strats='max', custom_cnn=None, custom_rnn=None, grid_size = [8, 8]):
+                 reduce_strats='max', custom_cnn=None, custom_rnn=None, grid_size = [8, 8],
+                 rai_dual_crop_inference: bool = False):
         # grid_size means how are the grid divided
         self._grid_size = grid_size
 
@@ -334,6 +335,37 @@ class rAIdiologist_Transformer(rAIdiologist):
         super().__init__(out_ch, record, 5, cnn_dropout, rnn_dropout, False, mode, reduce_strats,
                          custom_cnn=cnn, custom_rnn=rnn)
         self.dropout = DropPatch(cnn_dropout)
+        # Inference-time half-patch dual-view path (radiology inference modes). Default off => unchanged behaviour.
+        self.rai_dual_crop_inference = bool(rai_dual_crop_inference)
+
+    _DUAL_VIEW_MODES = (2, 3, -1)
+
+    def _dual_view_inference_enabled(self) -> bool:
+        return (
+            self.rai_dual_crop_inference
+            and int(self._mode) in self._DUAL_VIEW_MODES
+            and not self.training
+        )
+
+    @staticmethod
+    def _shift_inplane(x: torch.Tensor, dh: int, dw: int) -> torch.Tensor:
+        r"""Translate (B x C x H x W x S) by ``dh`` rows and ``dw`` columns (non-negative) in the H/W plane. The
+        vacated border is zero-filled (no wrap-around, so not ``torch.roll``). S is never shifted.
+
+        .. note:: Zero background is assumed. UNVERIFIED for Nyul-normalised volumes (see plan S2).
+        """
+        out = torch.zeros_like(x)
+        out[:, :, dh:, dw:] = x[:, :, :x.shape[2] - dh, :x.shape[3] - dw]
+        return out
+
+    @staticmethod
+    def _interleave_views(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+        r"""Interleave two encodings (B x C x h x w x S) per slice as [view0 cells (h*w), view1 cells (h*w)] and
+        flatten to (B x C x S*2*h*w). Token order is (s v w h), matching ``sa_from_playback``.
+        """
+        a = einops.rearrange(x0, 'b c h w s -> b c s (w h)')
+        b = einops.rearrange(x1, 'b c h w s -> b c s (w h)')
+        return einops.rearrange(torch.stack([a, b], dim=3), 'b c s v n -> b c (s v n)')
 
     def collect_playback_transformer(self, original_size, grid_size) -> None:
         """Collects self-attention tensors from the RNN's playback. This function retrieves and processes the
@@ -393,8 +425,8 @@ class rAIdiologist_Transformer(rAIdiologist):
 
         # It is expected the output for the cnn part is already zero padded for inputs with different number of slices.
         nonzero_slices, top_slices = RAN_25D.get_nonzero_slices(x.detach().cpu())
-        reduced_x, x = self.cnn(x)     # Shape -> x: (B x 2048 x (grid_size * S)); reduced_x: (B x C)
-        _, __, h, w, s = x.shape
+        reduced_x, x_cnn = self.cnn(x)     # Shape -> x_cnn: (B x 2048 x h x w x S); reduced_x: (B x C)
+        _, __, h, w, s = x_cnn.shape
         grid_size = {
             'h': h,
             'w': w,
@@ -406,7 +438,15 @@ class rAIdiologist_Transformer(rAIdiologist):
             'w': w,
             's': s - 1
         }
-        x = self.dropout(einops.rearrange(x, 'b c h w s -> b c (s w h)'))
+        # Dual-view path: radiology inference (modes 2, 3, or -1 from set_mode). Otherwise unchanged.
+        dual = self._dual_view_inference_enabled()
+        if dual:
+            # Second encoding of the in-plane half-patch shifted input (S axis is not shifted)
+            _, x_shift = self.cnn(self._shift_inplane(x, x.shape[2] // (2 * h), x.shape[3] // (2 * w)))
+            x = self._interleave_views(x_cnn, x_shift)
+        else:
+            x = einops.rearrange(x_cnn, 'b c h w s -> b c (s w h)')
+        x = self.dropout(x)
 
         while x.dim() < 3:
             x = x.unsqueeze(0)
@@ -417,8 +457,14 @@ class rAIdiologist_Transformer(rAIdiologist):
         x = einops.rearrange(x, 'b c s ->  b s c')
 
         # o: (B x S x out_ch)
-        o = self.rnn(x[:, h * w:],  # discard the first and last slice because CNN kernel is [3x3x3]
-                     torch.as_tensor(top_slices).int() * h * w - 1) # -1 discard the last slice
+        if dual:
+            # Drop the first slice (2*h*w tokens), as the single-view path drops h*w. Tensor length is then
+            # 2 + 2*h*w*(s-1) (plan). Mask cut mirrors single-view ``top * h*w - 1`` in token units.
+            o = self.rnn(x[:, 2 * h * w:],
+                         torch.as_tensor(top_slices).int() * 2 * h * w - 1)
+        else:
+            o = self.rnn(x[:, h * w:],  # discard the first and last slice because CNN kernel is [3x3x3]
+                         torch.as_tensor(top_slices).int() * h * w - 1) # -1 discard the last slice
         if self.RECORD_ON and not self.training:
             self.collect_playback_transformer(sa_reconshape, grid_size_4_SA)
 
@@ -472,9 +518,10 @@ class rAIdiologist_Transformer(rAIdiologist):
         return x[:, 1]
 
 
-def create_rAIdiologist_v5_1():
-    r"""This version does output channel = 2"""
-    return rAIdiologist_Transformer(1, 1)
+def create_rAIdiologist_v5_1(rai_dual_crop_inference: bool = False):
+    r"""This version does output channel = 2. ``rai_dual_crop_inference`` enables the inference-time half-patch
+    dual-view path when mode is in ``(2, 3, -1)``."""
+    return rAIdiologist_Transformer(1, 1, rai_dual_crop_inference=rai_dual_crop_inference)
 
 
 def create_rAIdiologist_v5_1_focused():

@@ -12,10 +12,10 @@ dependencies = [
     "numpy==1.26.3",
     "setuptools==75.8.0",
     # UI. gradio 5 needs Python>=3.10, so use the newest 4.x for py3.9; hub/pydantic pinned to what 4.44 supports.
-    "gradio>=4.44,<5",
+    "gradio>=4.44,<6",
     "huggingface_hub==0.36.2",
     "pydantic==2.10.5",
-    "streamlit",
+    "streamlit>=1.49.0",     # accept_multiple_files="directory" (folder upload) since 1.49
     # Versions below follow the dev_torch2 pip list.
     "SimpleITK==2.2.1",
     "opencv-python==4.6.0.66",

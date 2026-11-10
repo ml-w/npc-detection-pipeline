@@ -38,6 +38,7 @@ sys.path.insert(0, str(_ROOT / 'discrimination_module'))
 
 from loctexthist.config.loctexthistCFG import NPCSegmentControllerCFG
 from loctexthist.cli.cli_inference import run_inference, run_inference_pipeline
+from types import SimpleNamespace
 from loctexthist.utils.img_proc import grow_segmentation, seg_post_main
 from loctexthist.utils.preprocess import NPCSegmentPreprocesser
 
@@ -105,7 +106,27 @@ def run_normalize(
         logger.info("{:-^80}".format(" DICOM → NIfTI Conversion "))
         nii_out = output_dir / 'nii_input'
         nii_out.mkdir(exist_ok=True)
-        dicom2nii(str(nii_dir), str(nii_out))
+        a = SimpleNamespace(
+            input=str(nii_dir),
+            output=str(nii_out),
+            depth=1,
+            idglobber=None,
+            num_workers=1,
+            check_image_type_tag=False,
+            dump_dicom_tags=False,
+            debug=False,
+            prefix='',
+            idlist=None,
+            usefname=False,
+            usepid=False,
+            addtime=False,
+            regex_replace=None,
+            custom_filename_format=None,
+            glob_id_from_directory=False,
+            log=False,
+            verbose=False
+        )
+        dicom2nii(a, logger)
         nii_dir = nii_out
         logger.info(f"Converted DICOM → NIfTI: {nii_dir}")
 

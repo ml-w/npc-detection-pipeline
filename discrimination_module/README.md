@@ -219,7 +219,8 @@ python rAIdiologist/cli/cli_inference_wi_playback.py \
   --image-data-dir  /path/to/NyulNormalized/ \
   --probmap-dir     /path/to/HuangMask/ \
   --checkpoint-dir  /path/to/rAIdiologist_B00.pt \
-  --output-dir      /path/to/output/
+  --output-dir      /path/to/output/ \
+  --dual-crop            # or --no-dual-crop
 ```
 
 Optional flags:
@@ -230,6 +231,7 @@ Optional flags:
 | `--id-list` | — | Explicit case IDs (repeatable) |
 | `--id-list-file` | — | Path to ID list file (overrides `--id-list`) |
 | `--inference-transform` | `../rAIdiologist/config/rAIdiologist_transform_inf.yaml` | Path to transform config |
+| `--dual-crop` / `--no-dual-crop` | on | Half-patch dual-view encoding for higher-resolution self-attention maps (passed to `create_rAIdiologist_v5_1(rai_dual_crop_inference=...)`) |
 | `--debug` | off | Enable debug logging |
 
 > **Warning**: **This standalone CLI is not the intended production path.** It skips normalisation and segmentation, so the input must already be Nyul-normalised and segmentation probability maps must be pre-computed. Use `cli_inference.py pipeline` from the repository root for end-to-end processing.

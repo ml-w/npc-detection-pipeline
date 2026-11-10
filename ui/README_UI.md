@@ -9,7 +9,25 @@ Two front-ends over one shared module, `inference_api.py`.
 
 Input is auto-detected: one or more NIfTI files (each file is one case), or a DICOM series (files, folder or `.zip`).
 DICOM is always converted + normalised. For NIfTI the **normalisation checkbox** decides (unticked = the file is
-treated as already normalised).
+treated as already normalised; ticked by default in both apps).
+
+## Input sources
+
+* **Files** - pick one or more files (or a `.zip`).
+* **Folder** - upload a whole folder (Streamlit: `st.file_uploader(accept_multiple_files="directory")`;
+  Gradio: `gr.File(file_count="directory")`). Sub-folders are walked recursively. Folder upload in Streamlit
+  requires **Streamlit >= 1.49.0**; older versions (e.g. 1.48.x) cannot do it, so the app shows a warning and falls
+  back to the multi-file selector in "Folder" mode: select all the files of the case manually, and they are treated as
+  the folder content.
+* **Server path** (Streamlit only) - read a folder or file that already lives on the server, without uploading it.
+  Disabled unless the environment variable **`NPC_UPLOAD_ROOT`** is set; the path (and every file found in it, after
+  symlinks are resolved) must lie inside that directory, otherwise it is rejected.
+  `NPC_UPLOAD_ROOT=/data/cases streamlit run app_streamlit.py`
+
+DICOM files are recognised by the `DICM` marker at byte 128, whatever their name (PACS exports often use UID-based
+names with no `.dcm` suffix); `.dcm` / `.ima` files are accepted by extension. After an upload or server path is read,
+the Streamlit page shows what was detected (e.g. "Detected: 120 DICOM files in 2 series"); choosing new files clears
+the previous results.
 
 ## Setup (dedicated venv; the repo's own requirements are untouched)
 
@@ -38,6 +56,11 @@ SeriesDescription / ProtocolName look like T2w-fs (`list_dicom_series` sets `is_
 "(T2w-fs)"; if none matches, the first series is preselected. Single-series uploads need no choice and show no
 selectbox. The Python API behaves the same way: an ambiguous upload raises `InputError` unless `series_uid` is given.
 
+**Scoring all series.** Streamlit's *Score all T2w-fs series* option (and `run_inference_batch(..., all_series=True)`,
+used by the Gradio app) scores each T2w-fs series as its own case, staging only that series' files. The model is
+trained on T2w-fs images, so other sequences are skipped (reported as "Skipped" rows) unless
+`include_non_t2w_fs=True` / *Also score series not identified as T2w-fs* is set; those results carry a warning.
+
 **Segmentation download.** When a segmentation exists, the result card offers *Download segmentation (NIfTI)*
 (`<case_id>_segmentation.nii.gz`). `export_segmentation()` writes the tumour mask on the ORIGINAL input grid: the
 same voxel grid, spacing, origin and direction as the uploaded image, not the resampled network grid. The button
@@ -56,6 +79,29 @@ position).
 Python API: `run_inference(paths)` scores one case and raises `InputError` on two or more NIfTI files;
 `run_inference_batch(paths)` scores every upload as its own case and returns a list of `CaseOutcome`
 (`name`, `result` or `error`, exactly one set).
+
+## Dual-crop Inference
+
+The **Advanced** expander in the Streamlit app has **Run dual-crop inference** (default off). It enables the
+half-patch dual-view encoding (`rai_dual_crop_inference`), which encodes the input twice (the second time shifted by
+half a CNN patch) and merges both onto a finer `(2h+1) x (2w+1)` canvas, giving higher-resolution self-attention
+maps. It only takes effect for inference modes `(2, 3, -1)`. **Run tumour segmentation** (localisation) is in the
+same expander and is independent of normalisation. The flag is part of the model and result cache keys, and
+`InferenceResult.dual_crop` reports whether the path was active. Python API: pass
+`rai_dual_crop_inference=True` to `run_inference` / `run_inference_batch`.
+
+## Caching & Performance
+
+* Cache keys are content-addressable: SHA-256 of the input file (DICOM: sorted per-file hashes) and of the weights,
+  not file names or per-run UUIDs. Re-running the same case, even with a different upload name, reuses results.
+* Preprocessing (normalisation / segmentation) is cached on disk under `~/.cache/npc-pipeline/preprocess/`.
+* Models (max 8) and inference results (LRU, max 32) are cached in memory; the file-hash memo holds up to 1000 entries.
+* Streamlit rendering caches key on the input hash (plus flags), so slices/grids are reused across runs of the same
+  case, and changing opacity/threshold does not re-run inference.
+* **Clear all caches** (sidebar) clears the Streamlit caches, the in-memory model/inference/hash caches, the disk
+  preprocessing cache and leftover `npc_*` temp directories, and resets the shown results. Use it if outputs look
+  inconsistent.
+* Temporary upload/scan directories are removed automatically when the session ends.
 
 ## Notes
 
